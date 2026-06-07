@@ -1,0 +1,63 @@
+# Docker build harness for the client crate, mirroring shared/compose.yml and
+# content/compose.yml. Driven by `bin/client`.
+#
+# Native Rust today (the NPC driver target): `rust:slim` is the right toolchain
+# and is already cached on the host. The wasm-target build that the pixijs view
+# wraps will be added here as a `wasm` service (à la shared/compose.yml) once the
+# core exposes its browser API — same pattern, different target + wasm-bindgen.
+#
+# The host mount persists `target/` (gitignored) between runs so rebuilds are
+# incremental.
+#
+# The shared logic crate (resonantdust-data) is bind-mounted from the main
+# repo's `shared/data` (the `shared → pixijs/src/shared` symlink) into the local
+# `shared-data` dir that client/Cargo.toml's `path = "shared-data"` dep resolves to
+# — so the client repo never commits a cross-submodule path. Mirrors how
+# gateway/compose.yml mounts `../shared/data`. `..` is relative to this file
+# (client/), i.e. the main repo root.
+#
+# `run` joins the external `resonantdust` network (created by the gateway compose)
+# so the client reaches the gate by service name — `ws://gate-claude:8474/ws`
+# (the isolated claude gate, per env isolation). build/check/test don't need it.
+networks:
+  resonantdust:
+    external: true
+
+services:
+  check:
+    image: rust:slim
+    volumes:
+      - .:/workspace/client
+      - ../shared:/workspace/client/shared
+    working_dir: /workspace/client
+    entrypoint: ["cargo"]
+    command: ["check", "--workspace", "--all-targets"]
+
+  build:
+    image: rust:slim
+    volumes:
+      - .:/workspace/client
+      - ../shared:/workspace/client/shared
+    working_dir: /workspace/client
+    entrypoint: ["cargo"]
+    command: ["build", "--workspace", "--release"]
+
+  run:
+    image: rust:slim
+    networks:
+      - resonantdust
+    volumes:
+      - .:/workspace/client
+      - ../shared:/workspace/client/shared
+    working_dir: /workspace/client
+    entrypoint: ["cargo"]
+    command: ["run", "--quiet"]
+
+  test:
+    image: rust:slim
+    volumes:
+      - .:/workspace/client
+      - ../shared:/workspace/client/shared
+    working_dir: /workspace/client
+    entrypoint: ["cargo"]
+    command: ["test", "--workspace"]

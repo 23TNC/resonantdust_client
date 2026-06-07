@@ -39,6 +39,11 @@ Thumbs.db
 /target/
 **/*.rs.bk
 
+# Bind-mount target for the shared workspace (compose mounts the main repo's
+# `shared/` here at build time). Never real source — never commit it, so a stray
+# host dir can't shadow the actual shared crates.
+/shared/
+
 # Cargo
 Cargo.lock
 
