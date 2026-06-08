@@ -46,6 +46,12 @@ services:
     image: rust:slim
     networks:
       - resonantdust
+    environment:
+      - RD_ENV=${RD_ENV:-claude}
+      - GATE_URL
+      - CLIENT_NAMES
+      - SKIP_MOVE_SYNC
+      - CUT_TREE_SPIKE
     volumes:
       - .:/workspace/client
       - ../shared:/workspace/client/shared

@@ -17,7 +17,11 @@ path = "src/main.rs"
 # commits a cross-submodule path. Mirrors gateway/Cargo.toml's `path = "shared-data"`.
 resonantdust-data = { path = "shared/data", features = ["protocol"] }
 # Wire (de)serialization of the shared protocol types on this side of the socket.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# HTTP fetch of the gate's `/content` bundle (peer content load). http-only, no
+# TLS backend (the gate is http://), matching gateway/Cargo.toml's reqwest.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 
 # ── Native transport (NPC driver + tests) ──────────────────────────────────
 # The wasm/browser build will NOT use these — it implements the same `Transport`
