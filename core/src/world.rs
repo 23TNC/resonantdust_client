@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use resonantdust_data::protocol::RowOp;
+use resonantdust_protocol::protocol::RowOp;
 
 use crate::rows::{CardRow, ZoneRow};
 
@@ -81,6 +81,27 @@ impl Cards {
     #[allow(dead_code)] // the per-card accessor NPC decision logic reads from
     pub fn current(&self, card_id: u32, now_ms: u64) -> Option<&CardRow> {
         current_of(self.by_id.get(&card_id)?, now_ms)
+    }
+
+    /// Overwrite the POSITION (`macro_zone` + `micro_location` + the placement bits
+    /// of `flags`) of EVERY version of `card_id` — present and future — to the
+    /// given values, preserving each version's other flags and `valid_at`. Anchors
+    /// a pending LOCAL move so a future-stamped server row (e.g. a recipe's
+    /// completion finalize, already in the store) can't promote and clobber the
+    /// prediction. A version the server REQUIRES (`pos_need`) is left untouched.
+    pub fn pin_position(&mut self, card_id: u32, macro_zone: u64, micro_location: u32, flags: u32) {
+        use resonantdust_codec::card_model::{placement_mask, pos_need};
+        let pmask = placement_mask();
+        if let Some(hist) = self.by_id.get_mut(&card_id) {
+            for row in hist.values_mut() {
+                if pos_need(row.flags) {
+                    continue;
+                }
+                row.macro_zone = macro_zone;
+                row.micro_location = micro_location;
+                row.flags = (row.flags & !pmask) | (flags & pmask);
+            }
+        }
     }
 
     /// Every card's current-at-`now_ms` row (skipping cards that are entirely
@@ -170,6 +191,15 @@ impl Zones {
         hist.values().filter(|z| z.time_ms() <= now_ms).max_by_key(|z| z.time_ms())
     }
 
+    /// Every zone's current-at-`now_ms` row (skipping zones that are entirely
+    /// future-stamped). Order follows `macro_zone`. The render surface walks
+    /// these to emit the tile grid.
+    pub fn current_all(&self, now_ms: u64) -> impl Iterator<Item = &ZoneRow> {
+        self.by_macro.values().filter_map(move |hist| {
+            hist.values().filter(|z| z.time_ms() <= now_ms).max_by_key(|z| z.time_ms())
+        })
+    }
+
     /// Anchor-aware GC, keyed by `macro_zone` (the zone IS its own key).
     pub fn gc(&mut self, now_ms: u64, mut pins_for_zone: impl FnMut(u64) -> Vec<u64>) {
         for (zone, hist) in self.by_macro.iter_mut() {
@@ -195,15 +225,15 @@ pub struct World {
 // The world is a `StackStore` so the shared `stack::plan_place` runs against it
 // client-side — the exact same validation/resolution the shard runs, for
 // predicted moves. `card_at` / `members_of` read the current-at-now rows.
-impl resonantdust_data::recipe_state::CardStore for World {
-    fn card_at(&self, card_id: u32, time_ms: u64) -> Option<resonantdust_data::recipe_state::CardView> {
+impl resonantdust_state::recipe_state::CardStore for World {
+    fn card_at(&self, card_id: u32, time_ms: u64) -> Option<resonantdust_state::recipe_state::CardView> {
         self.cards.current(card_id, time_ms).map(card_view)
     }
 }
 
-impl resonantdust_data::stack::StackStore for World {
-    fn members_of(&self, root_id: u32, now_ms: u64) -> Vec<resonantdust_data::recipe_state::CardView> {
-        use resonantdust_data::card_model::Micro;
+impl resonantdust_state::stack::StackStore for World {
+    fn members_of(&self, root_id: u32, now_ms: u64) -> Vec<resonantdust_state::recipe_state::CardView> {
+        use resonantdust_codec::card_model::Micro;
         self.cards
             .current_all(now_ms)
             .filter(|r| {
@@ -215,8 +245,8 @@ impl resonantdust_data::stack::StackStore for World {
 }
 
 /// View a stored row as the shared model's `CardView`.
-fn card_view(r: &CardRow) -> resonantdust_data::recipe_state::CardView {
-    resonantdust_data::recipe_state::CardView {
+fn card_view(r: &CardRow) -> resonantdust_state::recipe_state::CardView {
+    resonantdust_state::recipe_state::CardView {
         card_id: r.card_id,
         owner_id: r.owner_id,
         micro_location: r.micro_location,
@@ -230,8 +260,8 @@ fn card_view(r: &CardRow) -> resonantdust_data::recipe_state::CardView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use resonantdust_data::card_model::Micro;
-    use resonantdust_data::packed::{pack_valid_at, STACK_DIR_UP};
+    use resonantdust_codec::card_model::Micro;
+    use resonantdust_codec::packed::{pack_valid_at, STACK_DIR_UP};
 
     /// Build a loose card row at `(time_ms)` for `card_id` with a snapped hex
     /// placement (the common world-tile shape), via the codec so the flag bits

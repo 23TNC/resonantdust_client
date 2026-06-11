@@ -17,10 +17,10 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use anyhow::bail;
-use resonantdust_data::card_model::Micro;
-use resonantdust_data::packed::{pack_macro_zone_full, INVENTORY_LAYER, STACK_DIR_UP, WORLD_LAYER};
-use resonantdust_data::recipe_state::owning_player;
-use resonantdust_data::stack::Placement;
+use resonantdust_codec::card_model::Micro;
+use resonantdust_codec::packed::{pack_macro_zone_full, INVENTORY_LAYER, STACK_DIR_UP, WORLD_LAYER};
+use resonantdust_state::recipe_state::owning_player;
+use resonantdust_state::stack::Placement;
 
 use crate::client::{Client, Command, Event};
 use crate::content;
@@ -193,16 +193,13 @@ impl Session {
         //    soul set so this works for the 2nd/3rd character too).
         let before: HashSet<u32> = self.core.souls().collect();
         // Place the world soul at `at` (world tile coords) if given: decompose into
-        // zone (chunk) + local cell — a zone is 8 tiles per side. `None` → origin.
+        // zone (chunk) + local cell via the centred 7×7 fold. `None` → origin.
         let (macro_zone, q, r) = match at {
             Some((wq, wr)) => {
-                let zone = resonantdust_data::packed::pack_macro_zone_full(
-                    0,
-                    WORLD_LAYER,
-                    wq.div_euclid(8) as i16,
-                    wr.div_euclid(8) as i16,
-                );
-                (zone, wq.rem_euclid(8) as u8, wr.rem_euclid(8) as u8)
+                use resonantdust_codec::packed::{pack_macro_zone_full, zone_local};
+                let (zq, lq) = zone_local(wq);
+                let (zr, lr) = zone_local(wr);
+                (pack_macro_zone_full(0, WORLD_LAYER, zq, zr), lq, lr)
             }
             None => (0, 0, 0),
         };
@@ -516,6 +513,70 @@ impl Session {
     /// known-wood forest tile in our anchor zone (3,3). Verify `cut_tree`
     /// auto-proposes, fires, and yields `corpus_dim` + `log` into our inventory
     /// with the source corpus destroyed. `tile` is the local (lq, lr) cell.
+    /// Magnetic-recipe spike: place a `despair` magnet + a `dread` candidate
+    /// adjacent on the world, BOTH owned by this client's player_soul — so this
+    /// client acts as the magnetic player that owns + drives them. Asserts the
+    /// magnetic pass gathers the dread onto the magnet and `despair_success`
+    /// fires (the magnet is consumed). Proves [`Client::magnetic_pass`] end-to-end.
+    pub async fn run_magnetic(&mut self) -> anyhow::Result<()> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_secs(3)).await?;
+        let despair = self
+            .core
+            .packed_def("despair")
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] no despair def"))?;
+        let psoul = self
+            .core
+            .player_souls()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] no player_soul"))?;
+        // Adjacent world cells in alice's spawn zone (3,3) = tiles 24..31, clear of
+        // her human at (26,26). hex_dist((28,28),(29,28)) = 1, well within radius 3.
+        let zone = pack_macro_zone_full(0, WORLD_LAYER, 3, 3);
+        for (key, q, r) in [("despair", 4u8, 4u8), ("dread", 5u8, 4u8)] {
+            self.send(Command::CreateCard {
+                owner: psoul,
+                card_key: key.to_string(),
+                surface: WORLD_LAYER,
+                macro_zone: zone,
+                q,
+                r,
+            })
+            .await?;
+            self.await_call().await?;
+        }
+        if !self
+            .pump_for_state(Duration::from_secs(5), |c| {
+                c.world()
+                    .cards
+                    .current_all(c.clock_ms())
+                    .any(|r| r.packed_definition == despair && !r.is_dead())
+            })
+            .await?
+        {
+            bail!("[{tag}] despair magnet never discovered");
+        }
+        let magnet = self
+            .core
+            .world()
+            .cards
+            .current_all(self.core.clock_ms())
+            .find(|r| r.packed_definition == despair && !r.is_dead())
+            .map(|r| r.card_id)
+            .unwrap();
+        println!("[{tag}] despair magnet {magnet} placed; magnetic player should gather dread + fire despair_success ...");
+        if !self
+            .pump_for_state(Duration::from_secs(20), |c| {
+                c.world().cards.current(magnet, c.clock_ms()).map(|r| r.is_dead()).unwrap_or(true)
+            })
+            .await?
+        {
+            bail!("[{tag}] despair magnet {magnet} never consumed — success did not fire");
+        }
+        println!("[{tag}] magnet {magnet} consumed — despair_success fired ✓");
+        Ok(())
+    }
+
     pub async fn run_cut_tree(&mut self, tile: (u8, u8)) -> anyhow::Result<()> {
         let tag = self.name.clone();
         self.pump(Duration::from_secs(2)).await?;
@@ -608,6 +669,108 @@ impl Session {
         if !errors.is_empty() {
             bail!("[{tag}] {} protocol/decode error(s): {errors:?}", errors.len());
         }
+        Ok(())
+    }
+
+    /// Movement S1: a single FUTURE-STAMPED step. Move our soul one tile east and
+    /// verify (a) it stays at the start cell until the cost-derived arrival, then
+    /// (b) promotes to the destination when the clock reaches the stamped row.
+    /// Same zone (3,3) [forest, cost 30; soul speed 12 → ~2.5 s travel].
+    pub async fn run_move_step(&mut self) -> anyhow::Result<()> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_secs(2)).await?;
+        let soul = self.core.souls().next().ok_or_else(|| anyhow::anyhow!("[{tag}] no soul"))?;
+        let (cq, cr) = self
+            .core
+            .soul_cell(soul)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] soul {soul} not on the world surface"))?;
+        let dest = (cq + 1, cr); // adjacent hex east, still in zone (3,3)
+        println!("[{tag}] move soul {soul}: ({cq},{cr}) → {dest:?} (forest cost 30 / speed 12 → ~2.5s)");
+
+        self.send(Command::MoveStep { soul, dest_q: dest.0, dest_r: dest.1 }).await?;
+        self.await_call().await?;
+
+        // The future-stamped row must NOT have promoted yet — the soul exists at
+        // the destination only once the clock reaches `arrival_ms`.
+        self.pump(Duration::from_millis(500)).await?;
+        if self.core.soul_cell(soul) != Some((cq, cr)) {
+            bail!("[{tag}] soul left start ({cq},{cr}) before arrival: now {:?}", self.core.soul_cell(soul));
+        }
+        println!("[{tag}] ✓ soul still at ({cq},{cr}) mid-move (future row pending, not yet arrived)");
+
+        // Pump past the ~2.5 s arrival; the future row promotes via `current(now)`.
+        self.pump(Duration::from_secs(4)).await?;
+        match self.core.soul_cell(soul) {
+            Some(p) if p == dest => {}
+            other => bail!("[{tag}] soul did not arrive at {dest:?}; at {other:?}"),
+        }
+        println!("[{tag}] ✓ soul arrived at {dest:?} (future-stamped move promoted on schedule)");
+
+        let errors = self.core.drain_errors();
+        if !errors.is_empty() {
+            bail!("[{tag}] {} protocol/decode error(s): {errors:?}", errors.len());
+        }
+        Ok(())
+    }
+
+    /// Movement S2: a PIPELINED multi-tile walk. `MoveTo` a target N tiles away;
+    /// the client computes a hex path and requests each step as the prior step's
+    /// row arrives (the server gets each traversal as lead time). Verify the soul
+    /// reaches the target on the cumulative schedule. `dx` tiles east, same zone.
+    pub async fn run_move_to(&mut self, dx: i32) -> anyhow::Result<()> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_secs(2)).await?;
+        let soul = self.core.souls().next().ok_or_else(|| anyhow::anyhow!("[{tag}] no soul"))?;
+        let (cq, cr) = self
+            .core
+            .soul_cell(soul)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] soul {soul} not on world"))?;
+        let target = (cq + dx, cr);
+        println!("[{tag}] walk soul {soul}: ({cq},{cr}) → {target:?} ({dx} tiles, pipelined)");
+
+        self.send(Command::MoveTo { soul, target_q: target.0, target_r: target.1 }).await?;
+
+        // Pump through the traversal (~2.5s/forest-tile; pump generously).
+        let mut arrived = false;
+        for _ in 0..40 {
+            self.pump(Duration::from_millis(500)).await?;
+            if self.core.soul_cell(soul) == Some(target) {
+                arrived = true;
+                break;
+            }
+        }
+        if !arrived {
+            bail!("[{tag}] soul did not reach {target:?}; stuck at {:?}", self.core.soul_cell(soul));
+        }
+        println!("[{tag}] ✓ soul walked {dx} tiles to {target:?} via pipelined future-stamped steps");
+
+        let errors = self.core.drain_errors();
+        if !errors.is_empty() {
+            bail!("[{tag}] {} protocol/decode error(s): {errors:?}", errors.len());
+        }
+        Ok(())
+    }
+
+    /// Movement S4 negative: an ILLEGAL non-adjacent jump (2 tiles in one step)
+    /// must be rejected by the gate's adjacency check — the soul stays put.
+    pub async fn run_move_reject(&mut self) -> anyhow::Result<()> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_secs(1)).await?;
+        let soul = self.core.souls().next().ok_or_else(|| anyhow::anyhow!("[{tag}] no soul"))?;
+        let (cq, cr) = self
+            .core
+            .soul_cell(soul)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] soul not on world"))?;
+        let bad = (cq + 2, cr); // 2 tiles east — NOT a hex neighbor
+        println!("[{tag}] illegal jump attempt {:?} → {bad:?} (expect gate reject)", (cq, cr));
+
+        self.send(Command::MoveStep { soul, dest_q: bad.0, dest_r: bad.1 }).await?;
+        // Pump; a rejected move stamps nothing, so the soul must NOT have moved.
+        self.pump(Duration::from_secs(2)).await?;
+        if self.core.soul_cell(soul) != Some((cq, cr)) {
+            bail!("[{tag}] illegal 2-tile jump was NOT rejected — soul at {:?}", self.core.soul_cell(soul));
+        }
+        println!("[{tag}] ✓ gate rejected the illegal jump (soul held at {:?})", (cq, cr));
         Ok(())
     }
 

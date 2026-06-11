@@ -17,14 +17,14 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use resonantdust_data::bridge::Card;
-use resonantdust_data::card_model::{stack_branch, stack_index};
-use resonantdust_data::loader::Bundle;
-use resonantdust_data::protocol::{ClientMsg, GateMsg, RowOp};
-use resonantdust_data::recipe::{build_frame, iterators};
-use resonantdust_data::recipe_state::CardStore;
-use resonantdust_data::stack::{self, plan_place, StackStore};
-use resonantdust_data::vm::match_recipe;
+use resonantdust_dsl::bridge::Card;
+use resonantdust_codec::card_model::{stack_branch, stack_index};
+use resonantdust_dsl::loader::Bundle;
+use resonantdust_protocol::protocol::{ClientMsg, GateMsg, RowOp};
+use resonantdust_dsl::recipe::{build_frame, iterators};
+use resonantdust_state::recipe_state::CardStore;
+use resonantdust_state::stack::{self, plan_place, StackStore};
+use resonantdust_dsl::vm::match_recipe;
 
 use crate::actions::{QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, TIME_DRIFT_RETRY_PAD_MS};
 use crate::clock::ClockSync;
@@ -66,10 +66,37 @@ pub enum Command {
     /// the soul def's `anchor_*` aspects); this command is the explicit entry.
     #[allow(dead_code)]
     SetAnchor { name: String, surface: u8, owner: u32, q: i32, r: i32, radii: crate::zones::AnchorRadii },
+    /// Move `soul` ONE tile to the adjacent world cell `(dest_q, dest_r)`. The
+    /// client computes the arrival time from the current + destination tile
+    /// `cost`s and the soul's `speed` (`travel = (cost_cur+cost_dst)·1000 /
+    /// (2·speed)` ms) and future-stamps the move via `move_soul`: the soul stays
+    /// at its current cell and "arrives" when the clock reaches `arrival_ms`.
+    MoveStep { soul: u32, dest_q: i32, dest_r: i32 },
+    /// Walk `soul` to the world cell `(target_q, target_r)`: the client computes a
+    /// hex path and PIPELINES the steps (one future-stamped `move_soul` per tile,
+    /// the next requested as each prior step's row arrives). A no-op if already
+    /// there or no path. Re-issuing replaces any in-flight movement (path change).
+    MoveTo { soul: u32, target_q: i32, target_r: i32 },
     /// Escape hatch: call an arbitrary gate/shard reducer. (Typed commands for
-    /// move_soul / place_card / propose_action land as the action path grows.)
+    /// place_card / propose_action land as the action path grows.)
     #[allow(dead_code)]
     Call { reducer: String, args: serde_json::Value },
+}
+
+/// An in-flight pipelined movement for one soul. The client requests step N+1 the
+/// moment step N's future-stamped row arrives, future-dating each at its
+/// cumulative arrival, so the soul walks the `path` on schedule.
+#[derive(Debug, Clone)]
+struct MovePlan {
+    /// Cells to visit in order; `path[0]` is adjacent to the start cell.
+    path: Vec<(i32, i32)>,
+    /// How many steps have been REQUESTED (`move_soul` sent for `path[0..requested]`).
+    requested: usize,
+    /// The cell the last-requested step lands on (to match its inbound row).
+    last_dest: (i32, i32),
+    /// `arrival_ms` (future `valid_at`) of the last-requested step — the departure
+    /// time for the next step.
+    last_arrival: u64,
 }
 
 /// Something the core observed while folding an inbound frame. The front-end's
@@ -194,6 +221,14 @@ pub struct Client {
     dirty_roots: HashSet<u32>,
     /// Local monotonic time (ms) the dirty set was last flushed — the budget gate.
     last_match_perf: f64,
+    /// Magnetic cards we own → their resolution deadline (server ms): first-seen
+    /// + the def's `magnetic.duration`. Drives [`Client::magnetic_pass`].
+    magnet_deadlines: HashMap<u32, u64>,
+    /// Magnets whose overdue `magnetic.failure` recipe we've already proposed —
+    /// so the deadline fires the fallback exactly once.
+    magnet_failed: HashSet<u32>,
+    /// Local monotonic time (ms) the magnetic pass last ran — its budget gate.
+    last_magnet_perf: f64,
     /// Cards we've already ensured an inventory zone for (any container we
     /// transitively own that carries `aspect.inventory`) — so the recursive
     /// ensure fires once per container. See [`ensure_owned_inventory`].
@@ -233,6 +268,11 @@ pub struct Client {
     /// entries and re-marks their chain roots dirty — the promotion kick. See
     /// [[project_future_row_progress_kick]].
     pending_promotions: Vec<(u64, u32)>,
+    /// In-flight movements, keyed by soul card_id. The client PIPELINES tile steps:
+    /// it requests step N+1 the instant it receives step N's future-stamped row
+    /// ([`advance_movement`](Self::advance_movement)), so the server has step N's
+    /// whole traversal to validate the next one. See [`Command::MoveTo`].
+    movements: HashMap<u32, MovePlan>,
     /// Live per-zone OBSERVER counts from the gate (`GateMsg::ZoneObservers`):
     /// `macro_zone -> distinct connections watching`. A move in a zone with
     /// `observers > 1` is in shared space and must sync immediately; `≤ 1` stays
@@ -245,11 +285,17 @@ pub struct Client {
 /// re-parse iterators / scan tokens for every recipe on every (budgeted) pass.
 struct RecipeMeta {
     name: String,
-    iters: Vec<resonantdust_data::recipe::Iter>,
+    iters: Vec<resonantdust_dsl::recipe::Iter>,
     /// The recipe reads/writes the `root` slot (matched root-anchored, no promotion).
     uses_root: bool,
     /// Bitmask of top-level branches the recipe references.
     want_branches: u32,
+    /// Per-`stack_id` window span = (max top-level offset referenced) + 1, for the
+    /// sliding top/bottom stacks (indices 2/3). A recipe reading `slot.2.0`+`slot.2.1`
+    /// has `branch_spans[2] == 2`; the matcher then slides that 2-wide window over the
+    /// top stack so the pair can match cards at ANY contiguous offset, not just 0,1.
+    /// Stacks 0 (root) and 1 (hex/tile) don't slide → their spans are unused.
+    branch_spans: [u8; 4],
     /// `@input` statement count — the action-queue debounce discriminator.
     input_count: usize,
     /// Aspect names this recipe **strictly requires** on a top-level slot (a
@@ -281,6 +327,9 @@ impl Default for Client {
             inflight_calls: HashMap::new(),
             dirty_roots: HashSet::new(),
             last_match_perf: 0.0,
+            magnet_deadlines: HashMap::new(),
+            magnet_failed: HashSet::new(),
+            last_magnet_perf: 0.0,
             inventoried: HashSet::new(),
             recipe_meta: Vec::new(),
             indexed_aspects: HashSet::new(),
@@ -289,6 +338,7 @@ impl Default for Client {
             dirty_positions: HashSet::new(),
             local_seq: 0,
             pending_promotions: Vec::new(),
+            movements: HashMap::new(),
             zone_observers: HashMap::new(),
         }
     }
@@ -299,6 +349,11 @@ impl Default for Client {
 /// `evaluate_root` per root — the action-queue debounce (seconds) absorbs the
 /// sub-second batching, so matches still resolve well within a window.
 const MATCH_BUDGET_MS: f64 = 1000.0;
+
+/// Magnetic-pass budget: scan owned magnets + gather/deadline at most once per
+/// this many local ms (see [`Client::magnetic_pass`]). 1s granularity is ample
+/// against multi-second magnetic windows.
+const MAGNET_BUDGET_MS: f64 = 1000.0;
 
 impl Client {
     pub fn new() -> Self {
@@ -375,6 +430,13 @@ impl Client {
         self.zone_observers.get(&macro_zone).copied().unwrap_or(0)
     }
 
+    /// The world hex `(q, r)` `card` currently sits at (CURRENT row at `now`, so a
+    /// future-stamped move row is excluded until it promotes), or `None` if it
+    /// isn't on the world surface. Used by the harness to track a moving soul.
+    pub fn soul_cell(&self, card: u32) -> Option<(i32, i32)> {
+        world_hex(self.world.cards.current(card, self.clock_ms)?)
+    }
+
     /// Drain every outbound frame the core has queued in response to inbound
     /// state — the soul-discovery roster subscriptions plus the zone subsystem's
     /// subscription / region / spawn frames. The driver calls this after each
@@ -449,6 +511,12 @@ impl Client {
                 // soul 0 — a manually-set anchor carries no per-soul memory.
                 self.zones.set_anchor(&name, q, r, surface, owner, radii, 0, self.clock_ms);
                 self.zone_frames()
+            }
+            Command::MoveStep { soul, dest_q, dest_r } => {
+                self.build_move_soul(soul, dest_q, dest_r).into_iter().collect()
+            }
+            Command::MoveTo { soul, target_q, target_r } => {
+                self.start_move_to(soul, target_q, target_r)
             }
             Command::Call { reducer, args } => {
                 vec![ClientMsg::Call { cid: self.cid(), reducer, args }]
@@ -560,7 +628,7 @@ impl Client {
         let me = self.player_id;
         // player_soul identity is by DEFINITION now (reserved 0xFFF0..=0xFFFF),
         // not the old `player_owned` flag.
-        let is_player_soul = resonantdust_data::packed::is_player_soul(packed);
+        let is_player_soul = resonantdust_codec::packed::is_player_soul(packed);
 
         // Role 1: our player_soul → subscribe the souls it owns.
         if me == Some(owner_id) && is_player_soul {
@@ -611,7 +679,7 @@ impl Client {
                     &format!("soul:{card_id}"),
                     q,
                     r,
-                    resonantdust_data::packed::WORLD_LAYER,
+                    resonantdust_codec::packed::WORLD_LAYER,
                     0,
                     radii,
                     card_id, // the soul this anchor represents (per-soul memory)
@@ -656,8 +724,8 @@ impl Client {
     /// Read one `aspect.<name>` int off a bundle `def_id` directly (the synthetic
     /// tile already carries its `def_id`, so this avoids a packed round-trip).
     fn aspect_of_def_id(&self, def_id: u16, aspect: &str) -> Option<i64> {
-        use resonantdust_data::bridge::{card_view, Card};
-        use resonantdust_data::vm::{Cell, Store};
+        use resonantdust_dsl::bridge::{card_view, Card};
+        use resonantdust_dsl::vm::{Cell, Store};
         let bundle = self.bundle.as_ref()?;
         let store = Store::with_root(card_view(bundle, &Card { def_id, stock: Vec::new() }));
         store.read(&format!("aspect.{aspect}")).map(Cell::as_int)
@@ -691,6 +759,34 @@ impl Client {
     /// proposal (commit-based sync — see [[project_card_position_sync]]). The
     /// moved card's chain root is marked dirty so the matcher re-evaluates.
     ///
+    /// Place a card loose at a GLOBAL world cell `(q, r)` on `(surface, owner)` —
+    /// folds the global coord to `(macro_zone, local)` and builds the Loose
+    /// placement. The view's drop path calls this with the resolved drop cell.
+    pub fn place_loose(
+        &mut self,
+        card_id: u32,
+        surface: u8,
+        owner: u32,
+        q: i32,
+        r: i32,
+    ) -> Result<Vec<ClientMsg>, String> {
+        use resonantdust_codec::packed::{pack_macro_zone_full, zone_local};
+        let (zq, lq) = zone_local(q);
+        let (zr, lr) = zone_local(r);
+        let macro_zone = pack_macro_zone_full(owner, surface, zq, zr);
+        self.place(card_id, stack::Placement::Loose { surface, macro_zone, q: lq, r: lr, x: 0, y: 0 })
+    }
+
+    /// Stack a card onto `parent_id` in `direction` (the drop-on-a-card path).
+    pub fn place_stack(
+        &mut self,
+        card_id: u32,
+        parent_id: u32,
+        direction: u8,
+    ) -> Result<Vec<ClientMsg>, String> {
+        self.place(card_id, stack::Placement::Stack { parent_id, direction })
+    }
+
     /// Returns `Err` (with reason) if the move is infeasible; an empty frame vec
     /// on success (nothing goes on the wire until a commit).
     pub fn place(
@@ -700,7 +796,21 @@ impl Client {
     ) -> Result<Vec<ClientMsg>, String> {
         let caller = self.player_id.unwrap_or(0);
         let now = self.clock_ms;
-        let plan = plan_place(&self.world, card_id, placement, caller, now)?;
+        // Stacking eligibility reads each card's content bit-fields; resolve them
+        // from our bundle (fall back to the regular-card default if it isn't
+        // loaded yet). See [`resonantdust_codec::stacking`].
+        let bundle = self.bundle.as_ref();
+        let bits = |p: u16| {
+            bundle
+                .map(|b| resonantdust_dsl::defs::stack_bits(b, p))
+                .unwrap_or(resonantdust_codec::stacking::DEFAULT_BITS)
+        };
+        // The source's chain root BEFORE the move. If a member leaves a chain (a
+        // drag-carry or unstack), that old root's queue must be re-evaluated even
+        // though its own row never changes — it just lost members. Marking the new
+        // roots (below) alone would leave a stale recipe queued on the old chain.
+        let old_root = self.chain_root(card_id);
+        let plan = plan_place(&self.world, card_id, placement, caller, now, &bits)?;
         let mut moved: Vec<u32> = Vec::with_capacity(plan.writes.len());
         for w in plan.writes {
             let Some(mut row) = self.world.cards.current(w.card_id, now).cloned() else {
@@ -710,13 +820,32 @@ impl Client {
             row.macro_zone = w.macro_zone;
             row.micro_location = micro_location;
             row.flags = flags;
-            row.valid_at = resonantdust_data::packed::pack_valid_at(now, self.next_local_seq());
+            row.valid_at = resonantdust_codec::packed::pack_valid_at(now, self.next_local_seq());
             self.world.cards.apply(RowOp::Update, row);
             self.dirty_positions.insert(w.card_id);
             moved.push(w.card_id);
             if let Some(root) = self.chain_root(w.card_id) {
                 self.dirty_roots.insert(root);
             }
+        }
+        // Re-evaluate the chain the source departed (it lost members → a queued
+        // recipe there may no longer match).
+        if let Some(root) = old_root {
+            self.dirty_roots.insert(root);
+        }
+        // Anchor each moved card's position across its WHOLE version history,
+        // including any future-stamped server row already in the store (a recipe
+        // completion finalize). Without this, that future row promotes when the
+        // clock reaches it and clobbers our local prediction. New rows arriving
+        // after this are handled by the dirty_position check in `apply_row`.
+        let pins: Vec<(u32, u64, u32, u32)> = moved
+            .iter()
+            .filter_map(|&id| {
+                self.world.cards.current(id, now).map(|c| (id, c.macro_zone, c.micro_location, c.flags))
+            })
+            .collect();
+        for (id, mz, ml, fl) in pins {
+            self.world.cards.pin_position(id, mz, ml, fl);
         }
         // Live-sync gate: a move into/within SHARED space (the destination zone has
         // observers > 1) or of an anchor-carrier syncs immediately; otherwise it
@@ -745,7 +874,7 @@ impl Client {
     /// `None` if none resolve. The single point that emits `move_cards`.
     fn build_move_cards(&mut self, ids: &[u32]) -> Option<ClientMsg> {
         let now = self.clock_ms;
-        let pmask = resonantdust_data::card_model::placement_mask();
+        let pmask = resonantdust_codec::card_model::placement_mask();
         let mut card_ids = Vec::new();
         let mut macro_zones = Vec::new();
         let mut micros = Vec::new();
@@ -778,6 +907,140 @@ impl Client {
         })
     }
 
+    /// The `cost` aspect of the tile at world cell `(macro_zone, local lq, lr)`,
+    /// read from the zone's stored tile grid (same path as [`Self::synthetic_tile`]).
+    /// `None` if the zone tiles aren't loaded or the cell is empty.
+    fn tile_cost(&self, macro_zone: u64, lq: usize, lr: usize) -> Option<i64> {
+        use resonantdust_codec::packed::{pack_definition, tile_def_id, tile_slot};
+        let now = self.clock_ms;
+        let zone = self.world.zones.current(macro_zone, now)?;
+        let words = zone.tile_words();
+        let def_id_tile = tile_def_id(&words, tile_slot(lq as u8, lr as u8));
+        if def_id_tile == 0 {
+            return None;
+        }
+        self.def_aspect(pack_definition(zone.tile_card_type(), def_id_tile), "cost")
+    }
+
+    /// The `cost` of the world tile at `(wq, wr)` (decomposes world hex → zone +
+    /// local), via [`Self::tile_cost`].
+    fn world_tile_cost(&self, wq: i32, wr: i32) -> Option<i64> {
+        use resonantdust_codec::packed::{pack_macro_zone_full, zone_local, WORLD_LAYER};
+        let (zq, lq) = zone_local(wq);
+        let (zr, lr) = zone_local(wr);
+        let mz = pack_macro_zone_full(0, WORLD_LAYER, zq, zr);
+        self.tile_cost(mz, lq as usize, lr as usize)
+    }
+
+    /// Build ONE future-stamped `move_soul` step: `soul` departs `from` at
+    /// `depart_ms` and arrives at the adjacent cell `dest` at `depart + travel`,
+    /// `travel = (cost_from + cost_dest)·1000 / (2·speed)` ms. Returns
+    /// `(frame, arrival_ms)`. `None` if the soul/tiles/speed don't resolve (the
+    /// cells must be in a loaded/active zone). The single point that emits
+    /// `move_soul`; the single-step and pipelined paths both go through it.
+    fn build_move_soul_step(
+        &mut self,
+        soul: u32,
+        from: (i32, i32),
+        dest: (i32, i32),
+        depart_ms: u64,
+    ) -> Option<(ClientMsg, u64)> {
+        use resonantdust_codec::packed::{pack_macro_zone_full, pack_micro_loose, zone_local, WORLD_LAYER};
+        let soul_def = self.world.cards.current(soul, self.clock_ms)?.packed_definition;
+        let speed = self.def_aspect(soul_def, "speed")?;
+        if speed <= 0 {
+            return None;
+        }
+        let cost_from = self.world_tile_cost(from.0, from.1)?;
+        let cost_dest = self.world_tile_cost(dest.0, dest.1)?;
+        let travel_ms = (((cost_from + cost_dest) * 1000) / (2 * speed)).max(1) as u64;
+        let arrival_ms = depart_ms + travel_ms;
+
+        let (dzq, dlq) = zone_local(dest.0);
+        let (dzr, dlr) = zone_local(dest.1);
+        let dest_macro = pack_macro_zone_full(0, WORLD_LAYER, dzq, dzr);
+        let dest_micro = pack_micro_loose(dlq, dlr, 0, 0);
+        let caller = self.player_id.unwrap_or(0);
+        let cid = self.cid();
+        // The gate RE-DERIVES `arrival_ms` from `soul_def`/`from`/`dest`/`depart_ms`
+        // (content cost + speed) and overrides ours; the shard verifies `soul_def`
+        // and the soul's actual cell at `depart_ms` == `from`. So our values are a
+        // prediction the server validates — a lie just gets the move rejected.
+        let frame = ClientMsg::Call {
+            cid,
+            reducer: "move_soul".to_string(),
+            args: serde_json::json!({
+                "client_time_ms": self.clock_ms,
+                "caller_player_id": caller,
+                "soul_id": soul,
+                "soul_def": soul_def,
+                "from_q": from.0,
+                "from_r": from.1,
+                "dest": { "surface": WORLD_LAYER, "macro_zone": dest_macro, "micro_location": dest_micro },
+                "depart_ms": depart_ms,
+                "arrival_ms": arrival_ms,
+            }),
+        };
+        Some((frame, arrival_ms))
+    }
+
+    /// A single immediate step from `soul`'s current cell to the adjacent
+    /// `(dest_q, dest_r)`, departing now ([`Command::MoveStep`]).
+    fn build_move_soul(&mut self, soul: u32, dest_q: i32, dest_r: i32) -> Option<ClientMsg> {
+        let now = self.clock_ms;
+        let from = world_hex(self.world.cards.current(soul, now)?)?;
+        self.build_move_soul_step(soul, from, (dest_q, dest_r), now).map(|(f, _)| f)
+    }
+
+    /// Plan + start a pipelined walk of `soul` to `(target_q, target_r)`: compute a
+    /// hex path, fire step 0 now, and record a [`MovePlan`] so each later step
+    /// fires as its predecessor's row arrives ([`advance_movement`](Self::advance_movement)).
+    fn start_move_to(&mut self, soul: u32, target_q: i32, target_r: i32) -> Vec<ClientMsg> {
+        let now = self.clock_ms;
+        let Some(start) = self.world.cards.current(soul, now).and_then(world_hex) else {
+            return Vec::new();
+        };
+        let path = hex_path(start, (target_q, target_r));
+        if path.is_empty() {
+            self.movements.remove(&soul);
+            return Vec::new();
+        }
+        match self.build_move_soul_step(soul, start, path[0], now) {
+            Some((frame, arrival)) => {
+                self.movements.insert(
+                    soul,
+                    MovePlan { last_dest: path[0], last_arrival: arrival, requested: 1, path },
+                );
+                vec![frame]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Pipeline hook: a future-stamped row for `soul` arrived at `arrival_ms`. If
+    /// it confirms the last-requested movement step, fire the next one (departing
+    /// at `arrival_ms`, the moment the soul reaches that cell), pushing it onto
+    /// the outbound queue. No-op if `soul` isn't moving or the path is complete.
+    fn advance_movement(&mut self, soul: u32, arrival_ms: u64) {
+        let Some((next, from)) = self.movements.get(&soul).and_then(|p| {
+            (p.requested < p.path.len()).then(|| (p.path[p.requested], p.last_dest))
+        }) else {
+            return;
+        };
+        // Confirm: the row at `arrival_ms` is the cell the last step landed on.
+        if self.world.cards.current(soul, arrival_ms).and_then(world_hex) != Some(from) {
+            return;
+        }
+        if let Some((frame, new_arrival)) = self.build_move_soul_step(soul, from, next, arrival_ms) {
+            self.pending_out.push(frame);
+            if let Some(p) = self.movements.get_mut(&soul) {
+                p.requested += 1;
+                p.last_dest = next;
+                p.last_arrival = new_arrival;
+            }
+        }
+    }
+
     /// Flush EVERY locally-moved (dirty) card position to the server as one batched
     /// `move_cards` — the commit point of the commit-based position model (called
     /// before a recipe proposal). Empty dirty set → no frame.
@@ -801,7 +1064,7 @@ impl Client {
     /// inventory). Its moves ALWAYS sync (can't defer — others' observation of the
     /// zones it anchors depends on it).
     fn is_anchor_carrier(&self, card_id: u32) -> bool {
-        use resonantdust_data::packed::{unpack_definition, SOUL_CARD_TYPE};
+        use resonantdust_codec::packed::{unpack_definition, SOUL_CARD_TYPE};
         self.world.cards.current(card_id, self.clock_ms).is_some_and(|c| {
             let (card_type, _) = unpack_definition(c.packed_definition);
             card_type == SOUL_CARD_TYPE || self.has_inventory(c.packed_definition)
@@ -822,7 +1085,7 @@ impl Client {
     /// to operate on and is dropped; root-only recipes (no iterators but
     /// referencing `root`) are kept — they fire ON their root.
     fn build_recipe_index(&mut self) {
-        use resonantdust_data::parser::Stmt;
+        use resonantdust_dsl::parser::Stmt;
         let mut meta: Vec<RecipeMeta> = Vec::new();
         let mut indexed: HashSet<String> = HashSet::new();
         if let Some(bundle) = self.bundle.as_ref() {
@@ -845,6 +1108,7 @@ impl Client {
                     name: name.to_string(),
                     uses_root,
                     want_branches: top_branch_mask(&iters),
+                    branch_spans: top_branch_spans(recipe),
                     input_count,
                     req_aspects,
                     iters,
@@ -862,8 +1126,8 @@ impl Client {
     /// Probing the bare def (empty stock) would read those as 0 and UNSOUNDLY skip
     /// any recipe that requires them (e.g. `cut_tree` needs the tile's `wood`).
     fn add_indexed_aspects_card(&self, card: &Card, out: &mut HashSet<String>) {
-        use resonantdust_data::bridge::card_view;
-        use resonantdust_data::vm::{Cell, Store};
+        use resonantdust_dsl::bridge::card_view;
+        use resonantdust_dsl::vm::{Cell, Store};
         let Some(bundle) = self.bundle.as_ref() else { return };
         let store = Store::with_root(card_view(bundle, card));
         for asp in &self.indexed_aspects {
@@ -961,7 +1225,7 @@ impl Client {
         self.world
             .cards
             .current(card_id, now_ms)
-            .is_some_and(|c| resonantdust_data::card_model::bind_blocked(c.flags))
+            .is_some_and(|c| resonantdust_codec::card_model::bind_blocked(c.flags))
     }
 
     fn match_recipes_inner(&self, soul: u32, root: u32, use_filter: bool) -> Vec<RecipeMatch> {
@@ -992,7 +1256,9 @@ impl Client {
         let live = view_t == now;
 
         // root's stack members (as the soul knows them, at `view_t`) grouped by
-        // branch (0 hex / 1 up / 2 down), each ordered by stack index.
+        // `stack_id` (= stack_branch + 1: 1 hex, 2 top, 3 bottom; 0 is the loose
+        // root, never a member), each ordered by stack index. Recipe slot numbers
+        // now equal the stack_id they address.
         let mut by_branch: BTreeMap<u8, Vec<(u8, u32)>> = BTreeMap::new();
         for m in self.world.members_of(root, view_t) {
             // Skip a member that's exclusively held (in-flight) or dead+claimed —
@@ -1000,7 +1266,7 @@ impl Client {
             if self.is_held(m.card_id, now) {
                 continue;
             }
-            by_branch.entry(stack_branch(m.flags)).or_default().push((stack_index(m.flags), m.card_id));
+            by_branch.entry(stack_branch(m.flags) + 1).or_default().push((stack_index(m.flags), m.card_id));
         }
         for v in by_branch.values_mut() {
             v.sort_by_key(|(idx, _)| *idx);
@@ -1008,7 +1274,9 @@ impl Client {
         let branch = |b: u8| -> Vec<u32> {
             by_branch.get(&b).map(|v| v.iter().map(|(_, id)| *id).collect()).unwrap_or_default()
         };
-        let base_branches: [Vec<u32>; 3] = [branch(0), branch(1), branch(2)];
+        // Indexed by stack_id: [0] is the root slot (`slot.0.0`, filled by the
+        // `root` param — never a member list), [1] hex/tile, [2] top, [3] bottom.
+        let base_branches: [Vec<u32>; 4] = [Vec::new(), branch(1), branch(2), branch(3)];
 
         // card_id → typed dsl Card, read at the soul's PER-CARD view time (a
         // world card at the root's view_t, an owned inventory item live at `now`).
@@ -1024,13 +1292,13 @@ impl Client {
             // Decode the row's per-instance stock u32 → positional slot values so
             // the recipe reads this card's actual stock aspects (build progress,
             // etc.), not just the def defaults.
-            let stock = resonantdust_data::bridge::stock_to_vec(bundle, name, c.stock);
+            let stock = resonantdust_dsl::bridge::stock_to_vec(bundle, name, c.stock);
             Some(Card { def_id: bundle.card_def_id(name)?, stock })
         };
 
-        // Synthetic branch-0 tile: the tile under the root, as the soul remembers
-        // it (read at `view_t`).
-        let synthetic = (root != 0).then(|| self.synthetic_tile(root, &base_branches[0], view_t)).flatten();
+        // Synthetic hex tile: the tile under the root (stack 1), as the soul
+        // remembers it (read at `view_t`).
+        let synthetic = (root != 0).then(|| self.synthetic_tile(root, &base_branches[1], view_t)).flatten();
 
         // Aspect pre-filter set: the indexed aspects actually present on the cards
         // that fill this candidate's top-level slots (read at each card's own view
@@ -1063,45 +1331,52 @@ impl Client {
 
             // The pass list mirrors recipeMatcher.ts: a root-anchored recipe is
             // tried with the root in place (no promotion); a branch recipe is
-            // tried with the root promoted into branch 1 (top), then branch 2
+            // tried with the root promoted into stack 2 (top), then stack 3
             // (bottom) — so a loose root acts as the first member of its chain.
-            let passes: Vec<(u32, [Vec<u32>; 3])> = if m.uses_root {
+            let passes: Vec<(u32, [Vec<u32>; 4])> = if m.uses_root {
                 if root == 0 { vec![] } else { vec![(root, base_branches.clone())] }
             } else if root == 0 {
                 vec![(0, base_branches.clone())]
             } else {
                 vec![
-                    (0, promote_root(root, &base_branches, 1)),
                     (0, promote_root(root, &base_branches, 2)),
+                    (0, promote_root(root, &base_branches, 3)),
                 ]
             };
 
-            for (pass_root, branches) in passes {
+            'passes: for (pass_root, branches) in passes {
                 if !anchors_fit(m.uses_root, m.want_branches, pass_root, &branches, synthetic.is_some()) {
                     continue;
                 }
-                let bindings = self.build_bindings(&m.iters, &branches, synthetic.is_some(), now);
-                // A root-only recipe (no iterators) operates on `pass_root`, which
-                // isn't in `bindings`; only skip the no-cards case when the recipe
-                // actually has slot iterators to fill.
-                if !m.iters.is_empty() && bindings.iter().all(|b| b.is_empty()) {
-                    continue;
-                }
-                let mut frame =
-                    build_frame(bundle, recipe, pass_root, &bindings, synthetic.as_ref(), &lookup);
-                let input = recipe.hook("input").map(|h| h.body.as_slice()).unwrap_or(&[]);
-                let matched = match_recipe(input, &mut frame.store, &bundle.catalog, &bundle.functions)
-                    .map(|p| p.matched)
-                    .unwrap_or(false);
-                if matched {
-                    matches.push(RecipeMatch {
-                        recipe: m.name.clone(),
-                        root: pass_root,
-                        bindings,
-                        live,
-                        input_count: m.input_count,
-                    });
-                    break; // first matching pass wins for this recipe
+                // Slide the top/bottom (stack 2/3) windows over the branch lists so
+                // the recipe's slots can match cards at ANY contiguous offset, not
+                // just index 0 (`corpus_b_top` = two adjacent corpus anywhere in the
+                // top stack; `corpus_dust` = a dust anywhere in it). Each `windowed`
+                // narrows stacks 2/3 to one candidate window; lowest offset wins.
+                for windowed in window_views(&branches, &m.branch_spans) {
+                    let bindings = self.build_bindings(&m.iters, &windowed, synthetic.is_some(), now);
+                    // A root-only recipe (no iterators) operates on `pass_root`, which
+                    // isn't in `bindings`; only skip the no-cards case when the recipe
+                    // actually has slot iterators to fill.
+                    if !m.iters.is_empty() && bindings.iter().all(|b| b.is_empty()) {
+                        continue;
+                    }
+                    let mut frame =
+                        build_frame(bundle, recipe, pass_root, &bindings, synthetic.as_ref(), &lookup);
+                    let input = recipe.hook("input").map(|h| h.body.as_slice()).unwrap_or(&[]);
+                    let matched = match_recipe(input, &mut frame.store, &bundle.catalog, &bundle.functions)
+                        .map(|p| p.matched)
+                        .unwrap_or(false);
+                    if matched {
+                        matches.push(RecipeMatch {
+                            recipe: m.name.clone(),
+                            root: pass_root,
+                            bindings,
+                            live,
+                            input_count: m.input_count,
+                        });
+                        break 'passes; // first matching (pass, window) wins for this recipe
+                    }
                 }
             }
         }
@@ -1109,14 +1384,14 @@ impl Client {
     }
 
     /// Per-iterator card_id bindings for a candidate, given the (possibly
-    /// promoted) top-level branch lists. Mirrors `buildBindings` in
-    /// recipeMatcher.ts: a top-level iterator takes its branch's cards (an empty
-    /// branch-0 with a synthetic tile takes the `[0]` sentinel); a nested
+    /// promoted) stack lists indexed by stack_id. Mirrors `buildBindings` in
+    /// recipeMatcher.ts: a top-level iterator takes its stack's cards (an empty
+    /// hex stack (1) with a synthetic tile takes the `[0]` sentinel); a nested
     /// iterator walks its resolved parent's chain in the iterator's branch.
     fn build_bindings(
         &self,
-        iters: &[resonantdust_data::recipe::Iter],
-        branches: &[Vec<u32>; 3],
+        iters: &[resonantdust_dsl::recipe::Iter],
+        branches: &[Vec<u32>; 4],
         has_synthetic: bool,
         now: u64,
     ) -> Vec<Vec<u32>> {
@@ -1131,8 +1406,8 @@ impl Client {
                     };
                 }
                 let cards = branches.get(it.branch as usize).cloned().unwrap_or_default();
-                if cards.is_empty() && it.branch == 0 && has_synthetic {
-                    return vec![0]; // synthetic-tile sentinel
+                if cards.is_empty() && it.branch == 1 && has_synthetic {
+                    return vec![0]; // synthetic-tile sentinel (stack 1, the hex member)
                 }
                 cards
             })
@@ -1143,7 +1418,7 @@ impl Client {
     /// card_id by walking `slot.B.O` (top-level branch lookup) then `owner`
     /// (owner_id) / `parent` (micro_location root) steps. `0` on any miss.
     /// Mirrors `nestedParent` in recipeMatcher.ts.
-    fn nested_parent(&self, parent: &str, branches: &[Vec<u32>; 3], now: u64) -> u32 {
+    fn nested_parent(&self, parent: &str, branches: &[Vec<u32>; 4], now: u64) -> u32 {
         let segs: Vec<&str> = parent.split('.').collect();
         let mut card_id = 0u32;
         let mut i = 0;
@@ -1183,14 +1458,16 @@ impl Client {
         card_id
     }
 
-    /// A card's stack members in one branch, ordered by stack index (the chain
-    /// walker for nested iterators). Mirrors `buildChain` / `branchWalker`.
+    /// A card's stack members in one stack, ordered by stack index (the chain
+    /// walker for nested iterators). `branch` is the iterator's `stack_id`
+    /// (1/2/3); the codec stores `stack_branch = stack_id − 1`, so compare on
+    /// `stack_branch + 1`. Mirrors `buildChain` / `branchWalker`.
     fn branch_members(&self, parent: u32, branch: u8, now: u64) -> Vec<u32> {
         let mut members: Vec<(u8, u32)> = self
             .world
             .members_of(parent, now)
             .into_iter()
-            .filter(|m| stack_branch(m.flags) == branch)
+            .filter(|m| stack_branch(m.flags) + 1 == branch)
             .map(|m| (stack_index(m.flags), m.card_id))
             .collect();
         members.sort_by_key(|(idx, _)| *idx);
@@ -1203,8 +1480,8 @@ impl Client {
     /// the cell's def + stock (mirrors `getZoneTileSlot` + ActionManager's
     /// synthetic-tile branch). Card-card tile promotion is not modelled yet.
     fn synthetic_tile(&self, root: u32, hex_branch: &[u32], now: u64) -> Option<Card> {
-        use resonantdust_data::card_model::Micro;
-        use resonantdust_data::packed::{pack_definition, surface_of, tile_def_id, tile_stock, WORLD_LAYER};
+        use resonantdust_codec::card_model::Micro;
+        use resonantdust_codec::packed::{pack_definition, surface_of, tile_def_id, tile_slot, tile_stock, WORLD_LAYER};
         if !hex_branch.is_empty() {
             return None; // a card occupies the hex branch — no synthetic tile
         }
@@ -1219,7 +1496,7 @@ impl Client {
         };
         let zone = self.world.zones.current(card.macro_zone, now)?;
         let words = zone.tile_words();
-        let idx = lr * 8 + lq;
+        let idx = tile_slot(lq as u8, lr as u8);
         let def_id_tile = tile_def_id(&words, idx);
         if def_id_tile == 0 {
             return None;
@@ -1247,7 +1524,7 @@ impl Client {
         zone.unique_tile_def_ids()
             .iter()
             .filter_map(|&def_id| {
-                let packed = resonantdust_data::packed::pack_definition(tile_type, def_id);
+                let packed = resonantdust_codec::packed::pack_definition(tile_type, def_id);
                 bundle.name_for_packed(packed).map(String::from)
             })
             .collect()
@@ -1363,6 +1640,187 @@ impl Client {
             self.flush_dirty();
         }
         self.fire_ready();
+        // Magnetic pass (budgeted): drive the magnets we own — gather in-range
+        // cards onto them to satisfy their recipe, or fire the overdue fallback.
+        if perf_ms - self.last_magnet_perf >= MAGNET_BUDGET_MS {
+            self.last_magnet_perf = perf_ms;
+            self.magnetic_pass();
+        }
+    }
+
+    /// One tick of the "magnetic player": drive every magnetic card we own. For
+    /// each magnet, pull in-range same-zone loose cards onto it to satisfy its
+    /// `magnetic.recipe` (the ordinary matcher then queues + proposes success),
+    /// and propose its `magnetic.failure` once the `magnetic.duration` window
+    /// lapses. Reuses [`Client::place`] (stacking marks the magnet dirty →
+    /// `evaluate_root`) and [`Client::propose`] (root-only failure). Staged so the
+    /// world/bundle borrows are released before the `&mut self` mutations.
+    fn magnetic_pass(&mut self) {
+        use resonantdust_codec::card_model::Micro;
+        use resonantdust_codec::packed::{owner_of, surface_of, unpack_macro_zone, world_tile};
+        if self.player_souls.is_empty() {
+            return;
+        }
+        let Some(bundle) = self.bundle.as_ref() else { return };
+        let now = self.clock_ms;
+
+        struct Plan {
+            magnet: u32,
+            surface: u8,
+            macro_zone: u64,
+            micro_location: u32,
+            cell: (i32, i32),
+            radius: i32,
+            duration_ms: u64,
+            failure: Option<String>,
+            /// Outstanding (branch, packed_def) the magnet still needs gathered.
+            need: Vec<(u8, u16)>,
+        }
+
+        // Phase A — read each owned magnet into an owned Plan.
+        let mut plans: Vec<Plan> = Vec::new();
+        for c in self.world.cards.current_all(now) {
+            if !self.player_souls.contains(&c.owner_id) {
+                continue;
+            }
+            let Some(recipe_id) = bundle.magnetic_recipe_id(c.packed_definition) else { continue };
+            // Only a loose card is a gatherable root.
+            let Micro::Loose { local_q, local_r, .. } = Micro::of(c.micro_location, c.flags) else {
+                continue;
+            };
+            let Some(success) = bundle.recipe_name(recipe_id).map(str::to_string) else { continue };
+            let Some(node) = bundle.recipe(&success) else { continue };
+            // Required (branch, def) counts, minus what's already stacked.
+            let mut want: HashMap<(u8, u16), u32> = HashMap::new();
+            for (branch, _off, def) in resonantdust_dsl::recipe::required_input_defs(bundle, node) {
+                *want.entry((branch, def)).or_insert(0) += 1;
+            }
+            let mut have: HashMap<(u8, u16), u32> = HashMap::new();
+            for m in self.world.members_of(c.card_id, now) {
+                if let Micro::Stacked { branch, .. } = Micro::of(m.micro_location, m.flags) {
+                    *have.entry((branch, m.packed_definition)).or_insert(0) += 1;
+                }
+            }
+            let mut need: Vec<(u8, u16)> = Vec::new();
+            for ((branch, def), n) in want {
+                for _ in have.get(&(branch, def)).copied().unwrap_or(0)..n {
+                    need.push((branch, def));
+                }
+            }
+            plans.push(Plan {
+                magnet: c.card_id,
+                surface: surface_of(c.macro_zone),
+                macro_zone: c.macro_zone,
+                micro_location: c.micro_location,
+                cell: (local_q as i32, local_r as i32),
+                radius: bundle.magnetic_radius(c.packed_definition).unwrap_or(0),
+                duration_ms: bundle.magnetic_duration_ms(c.packed_definition).unwrap_or(0),
+                failure: bundle
+                    .magnetic_failure_recipe_id(c.packed_definition)
+                    .and_then(|id| bundle.recipe_name(id))
+                    .map(str::to_string),
+                need,
+            });
+        }
+        if plans.is_empty() {
+            let known: Vec<u32> = self.magnet_deadlines.keys().copied().collect();
+            for m in known {
+                self.zones.clear_anchor(&format!("mag:{m}"), now);
+            }
+            self.magnet_deadlines.clear();
+            self.magnet_failed.clear();
+            let frames = self.zone_frames();
+            self.pending_out.extend(frames);
+            return;
+        }
+
+        // Phase B — pick in-range loose candidates for each shortfall. A card is
+        // claimed once across the whole pass (`used`), so two magnets / two slots
+        // never grab the same card.
+        let mut used: HashSet<u32> = HashSet::new();
+        let mut stack_ops: Vec<(u32, u32, u8)> = Vec::new(); // (candidate, magnet, direction)
+        for p in &plans {
+            for &(branch, def) in &p.need {
+                let pick = self
+                    .world
+                    .cards
+                    .current_all(now)
+                    .filter(|c| {
+                        c.card_id != p.magnet
+                            && c.macro_zone == p.macro_zone
+                            && c.packed_definition == def
+                            && !used.contains(&c.card_id)
+                            && matches!(Micro::of(c.micro_location, c.flags), Micro::Loose { .. })
+                    })
+                    .filter_map(|c| match Micro::of(c.micro_location, c.flags) {
+                        Micro::Loose { local_q, local_r, .. } => {
+                            let d = hex_distance(p.cell, (local_q as i32, local_r as i32));
+                            (d <= p.radius).then_some((d, c.card_id))
+                        }
+                        _ => None,
+                    })
+                    .min(); // nearest, then lowest id
+                if let Some((_, cand)) = pick {
+                    used.insert(cand);
+                    // recipe branch (1 hex / 2 top / 3 bottom) → STACK_DIR (0/1/2).
+                    stack_ops.push((cand, p.magnet, branch.saturating_sub(1)));
+                }
+            }
+        }
+
+        // Phase C — mutate. Anchor each magnet so its neighbourhood (the cards it
+        // attracts, which we may not own) is subscribed; idempotent per pass.
+        for p in &plans {
+            let (zq, zr) = unpack_macro_zone(p.macro_zone);
+            self.zones.set_anchor(
+                &format!("mag:{}", p.magnet),
+                world_tile(zq, p.cell.0 as u8),
+                world_tile(zr, p.cell.1 as u8),
+                p.surface,
+                owner_of(p.macro_zone),
+                crate::zones::AnchorRadii { active: p.radius.max(1), ..Default::default() },
+                0,
+                now,
+            );
+        }
+        // Stack gathered cards, fire overdue failures, prune.
+        for (cand, magnet, direction) in stack_ops {
+            if let Ok(frames) =
+                self.place(cand, stack::Placement::Stack { parent_id: magnet, direction })
+            {
+                self.pending_out.extend(frames);
+            }
+            self.dirty_roots.insert(magnet);
+        }
+        for p in &plans {
+            let deadline = *self.magnet_deadlines.entry(p.magnet).or_insert(now + p.duration_ms);
+            if now >= deadline && !self.magnet_failed.contains(&p.magnet) {
+                if let Some(fail) = &p.failure {
+                    if let Ok(frames) = self.propose(
+                        fail,
+                        p.magnet,
+                        Vec::new(),
+                        p.surface,
+                        p.macro_zone,
+                        p.micro_location,
+                    ) {
+                        self.pending_out.extend(frames);
+                        self.magnet_failed.insert(p.magnet);
+                    }
+                }
+            }
+        }
+        // Drop anchors + state for magnets that are gone (consumed / not ours).
+        let live: HashSet<u32> = plans.iter().map(|p| p.magnet).collect();
+        let stale: Vec<u32> =
+            self.magnet_deadlines.keys().copied().filter(|k| !live.contains(k)).collect();
+        for m in stale {
+            self.zones.clear_anchor(&format!("mag:{m}"), now);
+        }
+        self.magnet_deadlines.retain(|k, _| live.contains(k));
+        self.magnet_failed.retain(|k| live.contains(k));
+        let frames = self.zone_frames();
+        self.pending_out.extend(frames);
     }
 
     /// Re-evaluate every dirty chain root and clear the set: resolve each root's
@@ -1414,7 +1872,7 @@ impl Client {
         // Action location = the original root card's cell.
         let Some(rc) = self.world.cards.current(root, now) else { return };
         let (surface, macro_zone, micro_location) = (
-            resonantdust_data::packed::surface_of(rc.macro_zone),
+            resonantdust_codec::packed::surface_of(rc.macro_zone),
             rc.macro_zone,
             rc.micro_location,
         );
@@ -1541,7 +1999,7 @@ impl Client {
     /// The chain root of a card: the card itself if loose, else its stack root.
     /// `None` if the card isn't currently known.
     fn chain_root(&self, card_id: u32) -> Option<u32> {
-        use resonantdust_data::card_model::Micro;
+        use resonantdust_codec::card_model::Micro;
         let card = self.world.cards.current(card_id, self.clock_ms)?;
         Some(match card.micro() {
             Micro::Stacked { root, .. } => root,
@@ -1629,8 +2087,29 @@ impl Client {
     fn apply_row(&mut self, table: &str, op: RowOp, row: serde_json::Value) -> Vec<Event> {
         match table {
             "cards" => match serde_json::from_value::<CardRow>(row) {
-                Ok(card) => {
+                Ok(mut card) => {
                     let card_id = card.card_id;
+                    // Position reconciliation: when we hold a pending LOCAL move for
+                    // this card (`dirty_position`), the server's row still carries the
+                    // pre-move position. Keep OURS — macro_zone + micro_location + the
+                    // placement bits of flags — and take only the server's holds/state.
+                    // The exception is `pos_need`: the server REQUIRES this position (a
+                    // spawn / authoritative relocation), so adopt it and drop the dirty
+                    // mark. Recipe OUTPUT writes carry `pos_want` (advisory), not
+                    // `pos_need`, so a card we drag-spliced mid-action keeps its
+                    // predicted index until our own move flushes.
+                    if matches!(op, RowOp::Insert | RowOp::Update)
+                        && self.dirty_positions.contains(&card_id)
+                    {
+                        if resonantdust_codec::card_model::pos_need(card.flags) {
+                            self.dirty_positions.remove(&card_id);
+                        } else if let Some(local) = self.world.cards.current(card_id, self.clock_ms) {
+                            let pmask = resonantdust_codec::card_model::placement_mask();
+                            card.macro_zone = local.macro_zone;
+                            card.micro_location = local.micro_location;
+                            card.flags = (card.flags & !pmask) | (local.flags & pmask);
+                        }
+                    }
                     let macro_zone = card.macro_zone;
                     let promote_at = card.time_ms();
                     let ev = match op {
@@ -1659,6 +2138,10 @@ impl Client {
                         // promotion kick — lifecycles / created cards re-evaluate).
                         if promote_at > self.clock_ms {
                             self.pending_promotions.push((promote_at, card_id));
+                            // Movement pipeline: a future-stamped soul row may be
+                            // a move step's arrival — if so, fire the next step now
+                            // (the server gets this step's whole traversal to OK it).
+                            self.advance_movement(card_id, promote_at);
                         }
                     }
                     vec![ev]
@@ -1691,6 +2174,7 @@ impl Client {
                             region.macro_region,
                             region.zone_presence,
                             region.zone_available,
+                            region.distance,
                         ),
                         RowOp::Delete => self.zones.note_region_removed(region.macro_region),
                     }
@@ -1723,7 +2207,7 @@ impl Client {
                         // that; it selects exactly our player_soul(s), independent
                         // of placement (player_souls carry real positions now).
                         let sid = self.sid();
-                        let player_soul_min = resonantdust_data::packed::PLAYER_SOUL_PACKED_MIN;
+                        let player_soul_min = resonantdust_codec::packed::PLAYER_SOUL_PACKED_MIN;
                         self.pending_out.push(ClientMsg::Sub {
                             sid,
                             table: "cards".to_string(),
@@ -1741,19 +2225,24 @@ impl Client {
     }
 }
 
-/// Does the recipe read or write the `root` slot (`*root…` / `&root…`)? A
-/// root-anchored recipe is matched with the candidate root placed (no
-/// promotion); a branch recipe folds the root into a stack branch instead.
-/// Mirrors `RecipeMeta.root` from `Content.recipeMeta`.
-fn recipe_references_root(recipe: &resonantdust_data::parser::Node) -> bool {
-    use resonantdust_data::parser::{Stmt, Token};
+/// Does the recipe read or write the chain root, addressed as `slot.0.<offset>`
+/// (branch 0)? A root-anchored recipe is matched with the candidate root placed
+/// (no promotion); a branch recipe folds the root into a stack instead. The
+/// path must *start* with `slot.0.` — a nested `…owner.slot.0.0` references some
+/// other card's root, not the action root. Mirrors `RecipeMeta.root`.
+fn recipe_references_root(recipe: &resonantdust_dsl::parser::Node) -> bool {
+    use resonantdust_dsl::parser::{Stmt, Token};
+    let starts_at_root = |p: &str| {
+        let segs: Vec<&str> = p.split('.').collect();
+        segs.len() >= 3 && segs[0] == "slot" && segs[1] == "0" && segs[2].parse::<u32>().is_ok()
+    };
     for hook in ["input", "output"] {
         let Some(h) = recipe.hook(hook) else { continue };
         for stmt in &h.body {
             let Stmt::Instr(toks) = stmt else { continue };
             for tok in toks {
                 if let Token::Slot(p) | Token::Value(p) = tok {
-                    if p == "root" || p.starts_with("root.") {
+                    if starts_at_root(p) {
                         return true;
                     }
                 }
@@ -1771,8 +2260,8 @@ fn recipe_references_root(recipe: &resonantdust_data::parser::Node) -> bool {
 /// with no `if`, with an `or` (the read may not gate the verb), or using other
 /// comparisons contribute nothing; nested-slot reads (`…owner.slot…aspect`) are
 /// excluded (the card isn't in the root's stack). Used to pre-filter the index.
-fn required_top_aspects(recipe: &resonantdust_data::parser::Node) -> Vec<String> {
-    use resonantdust_data::parser::{Stmt, Token};
+fn required_top_aspects(recipe: &resonantdust_dsl::parser::Node) -> Vec<String> {
+    use resonantdust_dsl::parser::{Stmt, Token};
     let mut out: Vec<String> = Vec::new();
     let Some(h) = recipe.hook("input") else { return out };
     for stmt in &h.body {
@@ -1805,14 +2294,83 @@ fn required_top_aspects(recipe: &resonantdust_data::parser::Node) -> Vec<String>
 /// Bitmask of the top-level (`parent == ""`) branches a recipe references —
 /// `RecipeMeta.branches`. Nested iterators don't contribute (they're reached
 /// through their parent's chain).
-fn top_branch_mask(iters: &[resonantdust_data::recipe::Iter]) -> u32 {
+fn top_branch_mask(iters: &[resonantdust_dsl::recipe::Iter]) -> u32 {
     iters.iter().filter(|it| it.parent.is_empty()).fold(0u32, |m, it| m | (1 << it.branch))
 }
 
-/// Promote a loose root into a stack branch: prepend it to `branch`'s card list
-/// (so it acts as the chain's first member, `slot.<branch>.0`) and leave the
-/// root slot empty. Mirrors `promoteRoot` in recipeMatcher.ts.
-fn promote_root(root: u32, base: &[Vec<u32>; 3], branch: usize) -> [Vec<u32>; 3] {
+/// Per-`stack_id` window span = (max top-level offset)+1, indexed by stack_id —
+/// `RecipeMeta.branch_spans`. Scans every `@input`/`@output` path's FIRST
+/// `slot.<b>.<o>` triple (the top-level iterator; nested triples come later in the
+/// path and don't widen a top-level window). A branch the recipe never references
+/// stays 0 (not slid). Only stacks 2/3 are slid by the matcher, but spans are
+/// computed for all so the field is self-describing.
+fn top_branch_spans(recipe: &resonantdust_dsl::parser::Node) -> [u8; 4] {
+    use resonantdust_dsl::parser::{Stmt, Token};
+    let mut spans = [0u8; 4];
+    for hook in ["input", "output"] {
+        let Some(h) = recipe.hook(hook) else { continue };
+        for stmt in &h.body {
+            let Stmt::Instr(toks) = stmt else { continue };
+            for tok in toks {
+                if let Token::Slot(p) | Token::Value(p) = tok {
+                    let segs: Vec<&str> = p.split('.').collect();
+                    if segs.first() == Some(&"slot") && segs.len() >= 3 {
+                        if let (Ok(b), Ok(o)) =
+                            (segs[1].parse::<usize>(), segs[2].parse::<u8>())
+                        {
+                            if b < 4 {
+                                spans[b] = spans[b].max(o.saturating_add(1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    spans
+}
+
+/// The candidate window layouts to try for one matching pass: the branch lists
+/// with the sliding stacks (2 top / 3 bottom) narrowed to each contiguous window
+/// of the recipe's span. Stacks 0/1 (root/hex-tile) NEVER slide — they pass
+/// through unchanged, so the synthetic-tile sentinel and root are preserved; a
+/// stack-2/3 branch with span 0 (unreferenced) also passes through. Lowest offset
+/// first → deterministic, first matching window wins. An empty result means a
+/// needed stack is shorter than its span — the recipe can't match this pass.
+fn window_views(branches: &[Vec<u32>; 4], spans: &[u8; 4]) -> Vec<[Vec<u32>; 4]> {
+    let starts = |len: usize, span: u8| -> Vec<usize> {
+        let s = span as usize;
+        if s == 0 {
+            vec![0] // not slid — the branch passes through unchanged
+        } else if len < s {
+            vec![] // window can't fit → no candidate
+        } else {
+            (0..=len - s).collect()
+        }
+    };
+    let s2 = starts(branches[2].len(), spans[2]);
+    let s3 = starts(branches[3].len(), spans[3]);
+    let mut out = Vec::with_capacity(s2.len() * s3.len());
+    for &k2 in &s2 {
+        for &k3 in &s3 {
+            let mut w = branches.clone();
+            if spans[2] > 0 {
+                w[2] = branches[2][k2..k2 + spans[2] as usize].to_vec();
+            }
+            if spans[3] > 0 {
+                w[3] = branches[3][k3..k3 + spans[3] as usize].to_vec();
+            }
+            out.push(w);
+        }
+    }
+    out
+}
+
+/// Promote a loose root into a stack: prepend it to that stack's card list (so
+/// it acts as the chain's first member, `slot.<stack_id>.0`) and leave the root
+/// slot empty. `branch` is the stack_id (2 top / 3 bottom). Mirrors `promoteRoot`
+/// in recipeMatcher.ts.
+fn promote_root(root: u32, base: &[Vec<u32>; 4], branch: usize) -> [Vec<u32>; 4] {
     let mut b = base.clone();
     let mut promoted = Vec::with_capacity(b[branch].len() + 1);
     promoted.push(root);
@@ -1822,13 +2380,14 @@ fn promote_root(root: u32, base: &[Vec<u32>; 3], branch: usize) -> [Vec<u32>; 3]
 }
 
 /// Whether a candidate's required anchors are all present in this pass — its
-/// root requirement and every top-level branch it references (a synthetic tile
-/// satisfies branch 0). Mirrors `anchorsFit` in recipeMatcher.ts.
+/// root requirement and every top-level stack it references (a synthetic tile
+/// satisfies stack 1, the hex member). `branches`/`want_branches` are indexed by
+/// stack_id. Mirrors `anchorsFit` in recipeMatcher.ts.
 fn anchors_fit(
     uses_root: bool,
     want_branches: u32,
     pass_root: u32,
-    branches: &[Vec<u32>; 3],
+    branches: &[Vec<u32>; 4],
     has_synthetic: bool,
 ) -> bool {
     if uses_root && pass_root == 0 {
@@ -1841,7 +2400,7 @@ fn anchors_fit(
         }
     }
     if has_synthetic {
-        have |= 1 << 0;
+        have |= 1 << 1;
     }
     (want_branches & !have) == 0
 }
@@ -1852,18 +2411,52 @@ fn anchors_fit(
 /// so `hex = chunk * ZONE_SIZE + local`. (A stacked soul has no own cell; it
 /// would inherit its root's — not a world-soul case, so treated as cell 0.)
 fn world_hex(card: &CardRow) -> Option<(i32, i32)> {
-    use resonantdust_data::card_model::Micro;
-    use resonantdust_data::packed::{surface_of, unpack_macro_zone, WORLD_LAYER};
-    const ZONE_SIZE: i32 = 8;
+    use resonantdust_codec::card_model::Micro;
+    use resonantdust_codec::packed::{surface_of, unpack_macro_zone, world_tile, WORLD_LAYER};
     if surface_of(card.macro_zone) != WORLD_LAYER {
         return None;
     }
     let (cq, cr) = unpack_macro_zone(card.macro_zone);
     let (lq, lr) = match card.micro() {
-        Micro::Loose { local_q, local_r, .. } => (local_q as i32, local_r as i32),
+        Micro::Loose { local_q, local_r, .. } => (local_q, local_r),
         Micro::Stacked { .. } => (0, 0),
     };
-    Some((cq as i32 * ZONE_SIZE + lq, cr as i32 * ZONE_SIZE + lr))
+    Some((world_tile(cq, lq), world_tile(cr, lr)))
+}
+
+/// Axial-hex distance between two world cells (`(|dq| + |dq+dr| + |dr|) / 2`).
+fn hex_distance(a: (i32, i32), b: (i32, i32)) -> i32 {
+    let (dq, dr) = (a.0 - b.0, a.1 - b.1);
+    (dq.abs() + (dq + dr).abs() + dr.abs()) / 2
+}
+
+/// The 6 axial-hex neighbors of `(q, r)`.
+fn hex_neighbors(q: i32, r: i32) -> [(i32, i32); 6] {
+    [(q + 1, r), (q - 1, r), (q, r + 1), (q, r - 1), (q + 1, r - 1), (q - 1, r + 1)]
+}
+
+/// Longest path the greedy walker will produce (a sanity cap).
+const MAX_PATH_STEPS: usize = 64;
+
+/// A greedy hex path from `start` (exclusive) to `target` (inclusive): each step
+/// takes the neighbor that most reduces the hex distance to `target`. Assumes all
+/// tiles are traversable (no obstacles yet), so greedy always converges; stops if
+/// no neighbor improves (already adjacent-blocked) or the cap is hit.
+fn hex_path(start: (i32, i32), target: (i32, i32)) -> Vec<(i32, i32)> {
+    let mut path = Vec::new();
+    let mut cur = start;
+    while cur != target && path.len() < MAX_PATH_STEPS {
+        let best = hex_neighbors(cur.0, cur.1)
+            .into_iter()
+            .min_by_key(|n| hex_distance(*n, target))
+            .unwrap();
+        if hex_distance(best, target) >= hex_distance(cur, target) {
+            break;
+        }
+        path.push(best);
+        cur = best;
+    }
+    path
 }
 
 /// Map a [`stack::Placement`] to the wire `place_card` `placement` arg (the
@@ -1888,7 +2481,7 @@ fn placement_json(p: &stack::Placement) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use resonantdust_data::packed::pack_valid_at;
+    use resonantdust_codec::packed::pack_valid_at;
 
     /// A `cards` Row frame in the exact wire shape (camelCase keys, every number
     /// stringified) the gate emits.
@@ -2030,8 +2623,8 @@ mod tests {
 
     #[test]
     fn place_validates_and_emits_place_card_frame_without_mutating_world() {
-        use resonantdust_data::card_model::{micro_is_card, Micro};
-        use resonantdust_data::packed::{is_player_soul, with_surface, STACK_DIR_UP, WORLD_LAYER};
+        use resonantdust_codec::card_model::{micro_is_card, Micro};
+        use resonantdust_codec::packed::{is_player_soul, with_surface, STACK_DIR_UP, WORLD_LAYER};
 
         fn row(card_id: u32, owner_id: u32, packed_definition: u16) -> CardRow {
             let (micro_location, flags) = Micro::snap(0, 0).apply(0);
@@ -2088,8 +2681,8 @@ mod tests {
 
     #[test]
     fn place_syncs_in_shared_zone_stays_local_when_private() {
-        use resonantdust_data::card_model::Micro;
-        use resonantdust_data::packed::{with_surface, STACK_DIR_UP, WORLD_LAYER};
+        use resonantdust_codec::card_model::Micro;
+        use resonantdust_codec::packed::{with_surface, STACK_DIR_UP, WORLD_LAYER};
 
         fn loose_row(card_id: u32, owner_id: u32, macro_zone: u64) -> CardRow {
             let (micro_location, flags) = Micro::snap(0, 0).apply(0);
@@ -2166,7 +2759,7 @@ mod tests {
 
     #[test]
     fn set_anchor_scopes_subscriptions_and_gates_region() {
-        use resonantdust_data::packed::WORLD_LAYER;
+        use resonantdust_codec::packed::WORLD_LAYER;
         let mut c = Client::new();
         // Region-interior anchor (chunk 2,2): the 3×3 active ring stays in region 0.
         let frames = c.dispatch(Command::SetAnchor {
@@ -2195,7 +2788,7 @@ mod tests {
 
     #[test]
     fn region_row_arrival_requests_each_active_zone_once() {
-        use resonantdust_data::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
+        use resonantdust_codec::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
         let mut c = Client::new();
         c.dispatch(Command::SetAnchor {
             name: "soul".to_string(),
@@ -2222,7 +2815,7 @@ mod tests {
 
     #[test]
     fn zone_arrival_clears_the_pending_request() {
-        use resonantdust_data::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
+        use resonantdust_codec::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
         let mut c = Client::new();
         c.dispatch(Command::SetAnchor {
             name: "soul".to_string(),
@@ -2273,7 +2866,7 @@ mod tests {
     /// A `cards` Row frame in wire shape with a specific owner / macro_zone /
     /// packed_definition (placement is a world/inventory snap via the codec).
     fn card_frame_at(card_id: u32, owner_id: u32, macro_zone: u64, packed_definition: u16) -> GateMsg {
-        use resonantdust_data::card_model::Micro;
+        use resonantdust_codec::card_model::Micro;
         let (micro_location, flags) = Micro::snap(0, 0).apply(0);
         GateMsg::Row {
             sid: 0,
@@ -2296,7 +2889,7 @@ mod tests {
 
     #[test]
     fn discovery_walks_player_to_soul_to_inventory() {
-        use resonantdust_data::packed::{
+        use resonantdust_codec::packed::{
             pack_macro_zone_full, INVENTORY_LAYER, PLAYER_SOUL_PACKED, WORLD_LAYER,
         };
 
@@ -2360,40 +2953,89 @@ mod tests {
 
     #[test]
     fn matcher_helpers_mirror_recipematcher_ts() {
-        use resonantdust_data::parser::parse;
-        use resonantdust_data::recipe::iterators;
+        use resonantdust_dsl::parser::parse;
+        use resonantdust_dsl::recipe::iterators;
 
-        // promote_root prepends the root into a branch and leaves root slot empty.
-        let base = [vec![], vec![10, 11], vec![]];
-        let p1 = promote_root(99, &base, 1);
-        assert_eq!(p1[1], vec![99, 10, 11]);
-        let p2 = promote_root(99, &base, 2);
-        assert_eq!(p2[2], vec![99]);
-        assert_eq!(p2[1], vec![10, 11]);
+        // promote_root prepends the root into a stack (by stack_id) and leaves
+        // the root slot empty.
+        let base = [vec![], vec![], vec![10, 11], vec![]];
+        let p1 = promote_root(99, &base, 2);
+        assert_eq!(p1[2], vec![99, 10, 11]);
+        let p2 = promote_root(99, &base, 3);
+        assert_eq!(p2[3], vec![99]);
+        assert_eq!(p2[2], vec![10, 11]);
 
-        // anchors_fit: root requirement + branch mask (synthetic satisfies branch 0).
-        assert!(anchors_fit(false, 0b10, 0, &[vec![], vec![1], vec![]], false));
-        assert!(!anchors_fit(true, 0, 0, &[vec![], vec![], vec![]], false), "root needed but absent");
-        assert!(anchors_fit(true, 0, 5, &[vec![], vec![], vec![]], false), "root present");
-        assert!(anchors_fit(false, 0b01, 0, &[vec![], vec![], vec![]], true), "synthetic gives branch 0");
-        assert!(!anchors_fit(false, 0b10, 0, &[vec![], vec![], vec![]], false), "branch 1 missing");
+        // anchors_fit: root requirement + stack mask (synthetic satisfies stack 1).
+        assert!(anchors_fit(false, 0b10, 0, &[vec![], vec![1], vec![], vec![]], false));
+        assert!(!anchors_fit(true, 0, 0, &[vec![], vec![], vec![], vec![]], false), "root needed but absent");
+        assert!(anchors_fit(true, 0, 5, &[vec![], vec![], vec![], vec![]], false), "root present");
+        assert!(anchors_fit(false, 0b10, 0, &[vec![], vec![], vec![], vec![]], true), "synthetic gives stack 1");
+        assert!(!anchors_fit(false, 0b100, 0, &[vec![], vec![], vec![], vec![]], false), "stack 2 missing");
 
         // recipe_references_root + top_branch_mask over parsed recipes.
-        let root_src = "<recipe>\n  ::r>\n    @input>\n      *root.aspect.x 1 ge if &root use\n";
+        let root_src = "<recipe>\n  ::r>\n    @input>\n      *slot.0.0.aspect.x 1 ge if &slot.0.0 use\n";
         let rn = parse(root_src).unwrap();
         let rr = rn.bucket("recipe").unwrap().def("r").unwrap();
         assert!(recipe_references_root(rr));
         assert_eq!(top_branch_mask(&iterators(rr)), 0, "root-only recipe has no branches");
 
         let cut_src = "<recipe>\n  ::c>\n    @input>\n\
-            \x20     *slot.0.0.aspect.wood 1 ge if &slot.0.0 use\n\
-            \x20     *slot.1.0.aspect.corpus_lit 1 ge if &slot.1.0 claim\n\
-            \x20     $card::axe *slot.1.0.owner.slot.1.0.def_id eq if &slot.1.0.owner.slot.1.0 share\n";
+            \x20     *slot.1.0.aspect.wood 1 ge if &slot.1.0 use\n\
+            \x20     *slot.2.0.aspect.corpus_lit 1 ge if &slot.2.0 claim\n\
+            \x20     $card::axe *slot.2.0.owner.slot.2.0.def_id eq if &slot.2.0.owner.slot.2.0 share\n";
         let cn = parse(cut_src).unwrap();
         let cr = cn.bucket("recipe").unwrap().def("c").unwrap();
-        assert!(!recipe_references_root(cr), "cut_tree is branch/tile-rooted, not root-anchored");
-        // top-level branches 0 (tile) + 1 (actor); the nested axe iterator doesn't count.
-        assert_eq!(top_branch_mask(&iterators(cr)), 0b11);
+        assert!(!recipe_references_root(cr), "cut_tree is tile/stack-rooted, not root-anchored");
+        // top-level stacks 1 (tile) + 2 (actor); the nested axe iterator doesn't count.
+        assert_eq!(top_branch_mask(&iterators(cr)), 0b110);
+    }
+
+    #[test]
+    fn top_branch_spans_counts_max_top_offset_plus_one() {
+        use resonantdust_dsl::parser::parse;
+        // slot.2.0 + slot.2.1 → span 2; the nested slot.2.0.owner.slot.2.0's first
+        // triple is also slot.2.0 (top-level), not a wider window.
+        let src = "<recipe>\n  ::r>\n    @input>\n\
+            \x20     $card::corpus *slot.2.0.def_id eq if &slot.2.0 use\n\
+            \x20     $card::corpus *slot.2.1.def_id eq if &slot.2.1 claim\n\
+            \x20     $card::axe *slot.2.0.owner.slot.2.0.def_id eq if &slot.2.0.owner.slot.2.0 share\n";
+        let n = parse(src).unwrap();
+        let r = n.bucket("recipe").unwrap().def("r").unwrap();
+        assert_eq!(top_branch_spans(r), [0, 0, 2, 0]);
+
+        // a root + single-dust recipe (corpus_dust shape) → top span 1.
+        let dust = "<recipe>\n  ::d>\n    @input>\n\
+            \x20     $card::corpus *slot.0.0.def_id eq if &slot.0.0 use\n\
+            \x20     $card::dust *slot.2.0.def_id eq if &slot.2.0 claim\n";
+        let dn = parse(dust).unwrap();
+        let dr = dn.bucket("recipe").unwrap().def("d").unwrap();
+        assert_eq!(top_branch_spans(dr), [1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn window_views_slides_top_and_bottom_only() {
+        // span-2 window over the top stack [10,11,12,13] → 3 adjacent windows;
+        // root(0)/hex(1)/bottom(3) pass through unchanged.
+        let branches = [vec![1], vec![2], vec![10, 11, 12, 13], vec![9]];
+        let views = window_views(&branches, &[0, 0, 2, 0]);
+        let tops: Vec<Vec<u32>> = views.iter().map(|w| w[2].clone()).collect();
+        assert_eq!(tops, vec![vec![10, 11], vec![11, 12], vec![12, 13]]);
+        for w in &views {
+            assert_eq!(w[0], vec![1]);
+            assert_eq!(w[1], vec![2]);
+            assert_eq!(w[3], vec![9]); // span-0 bottom unchanged
+        }
+    }
+
+    #[test]
+    fn window_views_span_zero_passthrough_and_too_short_empty() {
+        // span 0 everywhere → one passthrough view.
+        let b = [vec![], vec![], vec![10, 11], vec![20]];
+        let v = window_views(&b, &[0, 0, 0, 0]);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0][2], vec![10, 11]);
+        // span 3 over a 2-card top → no candidate window.
+        assert!(window_views(&b, &[0, 0, 3, 0]).is_empty());
     }
 
     #[test]

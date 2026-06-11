@@ -1,6 +1,6 @@
 //! Transport seam.
 //!
-//! The client speaks the gate protocol ([`resonantdust_data::protocol`]) over
+//! The client speaks the gate protocol ([`resonantdust_protocol::protocol`]) over
 //! *some* duplex channel of JSON text frames. This trait is that seam: the
 //! native build (here) uses a real WebSocket via tokio-tungstenite; the browser
 //! build will implement the same trait over a `web-sys` WebSocket — the wasm

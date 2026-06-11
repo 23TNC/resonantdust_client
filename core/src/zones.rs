@@ -32,12 +32,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use resonantdust_data::packed::{
-    owner_of, pack_macro_zone_full, region_of_zone, surface_of, unpack_macro_zone, INVENTORY_LAYER,
+use resonantdust_codec::packed::{
+    owner_of, pack_macro_zone_full, region_of_zone, surface_of, unpack_macro_zone, world_tile,
+    zone_local, INVENTORY_LAYER, ZONE_SIZE,
 };
-
-/// Hexes per zone edge — the only place tile coords fold to chunk coords.
-const ZONE_SIZE: i32 = 8;
 
 /// Subscription/memory tier for a tracked zone, in nested distance bands (active
 /// tightest). Tier = which band the zone falls in for the closest-binding anchor.
@@ -179,14 +177,15 @@ fn anchor_coverage(a: &Anchor) -> HashMap<u64, ZoneTier> {
 /// Chunk coords whose extent intersects the Chebyshev tile-disk of `radius`
 /// tiles around hex `(aq, ar)`.
 fn chunks_in_disk(aq: i32, ar: i32, radius: i32) -> Vec<(i16, i16)> {
-    let lo_q = (aq - radius).div_euclid(ZONE_SIZE);
-    let hi_q = (aq + radius).div_euclid(ZONE_SIZE);
-    let lo_r = (ar - radius).div_euclid(ZONE_SIZE);
-    let hi_r = (ar + radius).div_euclid(ZONE_SIZE);
+    // `zone_local` folds a tile coord to its zone, applying TILE_CENTER.
+    let lo_q = zone_local(aq - radius).0;
+    let hi_q = zone_local(aq + radius).0;
+    let lo_r = zone_local(ar - radius).0;
+    let hi_r = zone_local(ar + radius).0;
     let mut out = Vec::new();
     for cq in lo_q..=hi_q {
         for cr in lo_r..=hi_r {
-            out.push((cq as i16, cr as i16));
+            out.push((cq, cr));
         }
     }
     out
@@ -232,6 +231,16 @@ struct RegionBits {
     presence: u64,
     #[allow(dead_code)]
     available: u64,
+    /// The container's disk radius (tiles); `u16::MAX` = unbounded (world).
+    #[allow(dead_code)]
+    distance: u16,
+}
+
+/// Cube/hex distance between axial tile coords. Mirrors `regions::hex_dist`.
+fn hex_dist(aq: i32, ar: i32, bq: i32, br: i32) -> i32 {
+    let dq = aq - bq;
+    let dr = ar - br;
+    (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
 }
 
 impl Default for ZoneManager {
@@ -619,11 +628,51 @@ impl ZoneManager {
     }
 
     /// Feed the latest presence/availability bits for a subscribed region.
-    pub fn note_region(&mut self, region: u64, presence: u64, available: u64) {
-        self.region_bits.insert(region, RegionBits { presence, available });
+    pub fn note_region(&mut self, region: u64, presence: u64, available: u64, distance: u16) {
+        self.region_bits.insert(region, RegionBits { presence, available, distance });
+        // A bounded container's disk may reach beyond this region into adjacent
+        // ones; ensure every region the disk touches so the whole inventory is
+        // declared (not just the region the viewport happens to anchor in).
+        self.ensure_disk_regions(region, distance);
         let Some(set) = self.region_wanted.get(&region) else { return };
         for zone in set.iter().copied().collect::<Vec<_>>() {
             self.maybe_request(zone);
+        }
+    }
+
+    /// Ensure every region whose macro_zones hold a tile within `distance` of the
+    /// owner-origin tile `(0,0)` — so a container disk that spills past one region
+    /// declares the neighbours too. No-op for an unbounded (`u16::MAX`) region
+    /// (the world) and for a disk that fits in its home region (the common case).
+    fn ensure_disk_regions(&mut self, macro_region: u64, distance: u16) {
+        if distance == u16::MAX {
+            return;
+        }
+        let owner = owner_of(macro_region);
+        let surface = surface_of(macro_region);
+        let d = distance as i32;
+        let zb = (d / ZONE_SIZE + 1) as i16; // zones whose tiles can reach within `distance` of (0,0)
+        for zq in -zb..=zb {
+            for zr in -zb..=zb {
+                // Does zone (zq, zr) hold any in-disk tile?
+                let mut hit = false;
+                'cells: for lq in 0..ZONE_SIZE {
+                    for lr in 0..ZONE_SIZE {
+                        if hex_dist(world_tile(zq, lq as u8), world_tile(zr, lr as u8), 0, 0) <= d {
+                            hit = true;
+                            break 'cells;
+                        }
+                    }
+                }
+                if !hit {
+                    continue;
+                }
+                let mz = pack_macro_zone_full(owner, surface, zq as i16, zr as i16);
+                let (r, _) = region_of_zone(mz);
+                if !self.region_bits.contains_key(&r) && self.ensured_regions.insert(r) {
+                    self.intents.push(ZoneIntent::EnsureRegion { zone: mz });
+                }
+            }
         }
     }
 
@@ -670,7 +719,7 @@ pub fn zone_parts(zone: u64) -> (u32, u8, i16, i16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use resonantdust_data::packed::WORLD_LAYER;
+    use resonantdust_codec::packed::WORLD_LAYER;
 
     fn world_zone(cq: i16, cr: i16) -> u64 {
         pack_macro_zone_full(0, WORLD_LAYER, cq, cr)
@@ -770,7 +819,7 @@ mod tests {
         let z = world_zone(1, 1);
         let _ = zm.take_intents();
         let (region, _) = region_of_zone(z);
-        zm.note_region(region, u64::MAX, u64::MAX);
+        zm.note_region(region, u64::MAX, u64::MAX, u16::MAX);
         let intents = zm.take_intents();
         assert!(intents.iter().any(|i| matches!(i, ZoneIntent::RequestZone { zone } if *zone == z)));
         assert!(zm.is_zone_present(z));

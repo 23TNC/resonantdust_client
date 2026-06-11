@@ -37,6 +37,10 @@ Thumbs.db
 
 # Rust build artifacts
 /target/
+# wasm build dir (cargo target for the wasm wrapper) + wasm-pack output — both
+# regenerable from core/ + wasm/ via `bin/client wasm`; never commit them.
+/target-wasm/
+/pkg/
 **/*.rs.bk
 
 # Bind-mount target for the shared workspace (compose mounts the main repo's

@@ -1,34 +1,9 @@
-[package]
-name = "resonantdust-client"
-version = "0.1.0"
-edition = "2021"
-publish = false
-description = "Resonant Dust shared client core — game-logic client run headless to drive NPCs (native target) and compiled to wasm to back the pixijs view. Prediction / recipe / lifecycle / stack model live here, sharing compiled code with the gate."
-
-[[bin]]
-name = "client"
-path = "src/main.rs"
-
-[dependencies]
-# Shared logic crate — the same rlib the SpacetimeDB modules and gateway link
-# directly (packing/codec, bit-fields, recipe matcher, VM). Referenced via a
-# LOCAL `shared-data` path that compose bind-mounts from the main repo's
-# `shared/data` (= pixijs/src/shared/data) at build time, so this repo never
-# commits a cross-submodule path. Mirrors gateway/Cargo.toml's `path = "shared-data"`.
-resonantdust-data = { path = "shared/data", features = ["protocol"] }
-# Wire (de)serialization of the shared protocol types on this side of the socket.
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-# HTTP fetch of the gate's `/content` bundle (peer content load). http-only, no
-# TLS backend (the gate is http://), matching gateway/Cargo.toml's reqwest.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
-
-# ── Native transport (NPC driver + tests) ──────────────────────────────────
-# The wasm/browser build will NOT use these — it implements the same `Transport`
-# trait over a web-sys WebSocket. Kept off the wasm target via cfg in transport.rs.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
-# Default features only (connect + handshake, NO TLS) — the gate is ws:// so we
-# avoid pulling openssl/native-tls (not present in rust:slim).
-tokio-tungstenite = "0.24"
-futures-util = "0.3"
-anyhow = "1"
+# Workspace root for the Resonant Dust client (a submodule). Split into:
+#   core/  resonantdust-client-core  (rlib + the NPC `client` bin) — pure logic
+#   wasm/  resonantdust-client        (cdylib) — the view-facing wasm wrapper
+# NPCs/harness build `-p resonantdust-client-core` (native); the view builds
+# `-p resonantdust-client` for wasm32. The render/graphics-facing code (render_region,
+# trees-as-cards) lives ONLY in the wasm crate, so the headless core can't link it.
+[workspace]
+members = ["core", "wasm"]
+resolver = "2"

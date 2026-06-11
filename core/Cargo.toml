@@ -1,0 +1,40 @@
+[package]
+name = "resonantdust-client-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Resonant Dust client CORE — pure sans-IO game logic (prediction / recipe / lifecycle / stack / clock / world mirror) run headless to drive NPCs and the multi-client harness. NO graphics/render code: the view-facing wasm wrapper (render_region, etc.) lives in the sibling `client-wasm` crate, so a NPC build can't even link it."
+
+# rlib so the native NPC bin links it AND the sibling wasm crate depends on it.
+# The `client` bin (main.rs) re-declares the module tree (its own tokio session
+# driver), so it compiles standalone; the lib re-exports the same modules for the
+# wasm crate to build on.
+[lib]
+name = "resonantdust_client_core"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+# Shared logic crates — the same rlibs the SpacetimeDB modules and gateway link
+# directly. Referenced via LOCAL `../shared/*` paths that compose bind-mounts from
+# the main repo's vendored `shared/` workspace at build time.
+resonantdust-codec = { path = "../shared/codec" }
+resonantdust-dsl = { path = "../shared/dsl" }
+resonantdust-state = { path = "../shared/state" }
+resonantdust-protocol = { path = "../shared/protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# ── Native transport (NPC driver + tests) ──────────────────────────────────
+# Excluded from wasm: the browser build (the sibling crate) uses web-sys directly
+# and never compiles the bin/session, so tokio/tungstenite/reqwest stay off the
+# wasm target.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"

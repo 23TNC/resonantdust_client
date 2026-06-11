@@ -9,7 +9,7 @@
 //! Generic over `T: Transport` (no `dyn`) so the async trait methods stay
 //! monomorphized and Send-free for the single-task client loop.
 
-use resonantdust_data::protocol::{ClientMsg, GateMsg};
+use resonantdust_protocol::protocol::{ClientMsg, GateMsg};
 
 use crate::transport::Transport;
 

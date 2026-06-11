@@ -10,8 +10,8 @@
 //! Placement / flag *meaning* is not decoded here; that's `resonantdust_codec`'s
 //! job, reached through the helpers below so the bit layout has one owner.
 
-use resonantdust_data::card_model::{self, Micro};
-use resonantdust_data::packed::valid_at_time;
+use resonantdust_codec::card_model::{self, Micro};
+use resonantdust_codec::packed::valid_at_time;
 use serde::Deserialize;
 
 /// Deserialize a number that arrived as a JSON string (the gate stringifies all
@@ -103,9 +103,6 @@ pub struct ZoneRow {
     #[serde(deserialize_with = "de_str_num")] t10: u64,
     #[serde(deserialize_with = "de_str_num")] t11: u64,
     #[serde(deserialize_with = "de_str_num")] t12: u64,
-    #[serde(deserialize_with = "de_str_num")] t13: u64,
-    #[serde(deserialize_with = "de_str_num")] t14: u64,
-    #[serde(deserialize_with = "de_str_num")] t15: u64,
 }
 
 /// One version-row of the `regions` table — the per-region spawn
@@ -121,6 +118,9 @@ pub struct RegionRow {
     #[serde(deserialize_with = "de_str_num")] pub zone_presence: u64,
     /// Bit `i` set → the zone at region slot `i` HAS been spawned.
     #[serde(deserialize_with = "de_str_num")] pub zone_available: u64,
+    /// Disk radius (tiles) the region is bounded by (presence + tile mask). The
+    /// client only reads `zone_presence`; carried for completeness / future use.
+    #[serde(deserialize_with = "de_str_num")] pub distance: u16,
 }
 
 impl RegionRow {
@@ -135,22 +135,22 @@ impl ZoneRow {
     }
 
     /// The tile grid as the codec's packed array.
-    pub fn tile_words(&self) -> [u64; 16] {
+    pub fn tile_words(&self) -> [u64; resonantdust_codec::packed::ZONE_TILE_U64_COUNT] {
         [
-            self.t0, self.t1, self.t2, self.t3, self.t4, self.t5, self.t6, self.t7, self.t8,
-            self.t9, self.t10, self.t11, self.t12, self.t13, self.t14, self.t15,
+            self.t0, self.t1, self.t2, self.t3, self.t4, self.t5, self.t6,
+            self.t7, self.t8, self.t9, self.t10, self.t11, self.t12,
         ]
     }
 
     /// The tile card_type for this zone's tiles (upper nibble of `packed_definition`).
     pub fn tile_card_type(&self) -> u8 {
-        resonantdust_data::packed::unpack_zone_definition(self.packed_definition)
+        resonantdust_codec::packed::unpack_zone_definition(self.packed_definition)
     }
 
     /// The distinct non-empty tile `def_id`s present in this zone (the "unique
     /// tile attributes" search keys, before aspect resolution).
     pub fn unique_tile_def_ids(&self) -> Vec<u16> {
-        use resonantdust_data::packed::{tile_def_id, ZONE_TILE_COUNT};
+        use resonantdust_codec::packed::{tile_def_id, ZONE_TILE_COUNT};
         let words = self.tile_words();
         let mut seen: Vec<u16> = Vec::new();
         for idx in 0..ZONE_TILE_COUNT {

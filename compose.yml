@@ -9,11 +9,12 @@
 # The host mount persists `target/` (gitignored) between runs so rebuilds are
 # incremental.
 #
-# The shared logic crate (resonantdust-data) is bind-mounted from the main
-# repo's `shared/data` (the `shared → pixijs/src/shared` symlink) into the local
-# `shared-data` dir that client/Cargo.toml's `path = "shared-data"` dep resolves to
-# — so the client repo never commits a cross-submodule path. Mirrors how
-# gateway/compose.yml mounts `../shared/data`. `..` is relative to this file
+# The shared logic workspace (codec/dsl/state/protocol/rules) is bind-mounted
+# from the main repo's `shared/` (now a real vendored dir, formerly the
+# `shared → pixijs/src/shared` symlink) into the local `shared` dir that
+# client/core/Cargo.toml's `path = "../shared/*"` deps resolve to — so the
+# client repo never commits a cross-submodule path. Mirrors how
+# gateway/compose.yml mounts `../shared`. `..` is relative to this file
 # (client/), i.e. the main repo root.
 #
 # `run` joins the external `resonantdust` network (created by the gateway compose)
@@ -31,7 +32,7 @@ services:
       - ../shared:/workspace/client/shared
     working_dir: /workspace/client
     entrypoint: ["cargo"]
-    command: ["check", "--workspace", "--all-targets"]
+    command: ["check", "-p", "resonantdust-client-core", "--all-targets"]
 
   build:
     image: rust:slim
@@ -40,7 +41,7 @@ services:
       - ../shared:/workspace/client/shared
     working_dir: /workspace/client
     entrypoint: ["cargo"]
-    command: ["build", "--workspace", "--release"]
+    command: ["build", "-p", "resonantdust-client-core", "--release"]
 
   run:
     image: rust:slim
@@ -52,12 +53,14 @@ services:
       - CLIENT_NAMES
       - SKIP_MOVE_SYNC
       - CUT_TREE_SPIKE
+      - MOVE_TEST
+      - MAGNETIC_SPIKE
     volumes:
       - .:/workspace/client
       - ../shared:/workspace/client/shared
     working_dir: /workspace/client
     entrypoint: ["cargo"]
-    command: ["run", "--quiet"]
+    command: ["run", "-p", "resonantdust-client-core", "--quiet"]
 
   test:
     image: rust:slim
@@ -66,4 +69,44 @@ services:
       - ../shared:/workspace/client/shared
     working_dir: /workspace/client
     entrypoint: ["cargo"]
-    command: ["test", "--workspace"]
+    command: ["test", "-p", "resonantdust-client-core"]
+
+  # Builds the JS/wasm bundle the view's worker imports — the browser client core.
+  # Mirrors shared/compose.yml's `wasm`: the spacetime image carries the wasm32
+  # target; wasm-bindgen-cli is installed on first run under target/wasm-tools
+  # (gitignored, persists via the host mount) and MUST match the wasm-bindgen
+  # version in Cargo.lock. We build ONLY the lib (`--lib`) with `--features wasm`
+  # (the tokio bin/session live in the core crate and never reach wasm32).
+  # Output: client/pkg/resonantdust_client.{js,wasm,d.ts}.
+  wasm:
+    image: clockworklabs/spacetime:latest
+    # Run as root: the native services (rust:slim) own Cargo.lock + target/ as
+    # root, and adding the wasm deps updates Cargo.lock — the spacetime image's
+    # default non-root user can't write those root-owned files.
+    user: "0:0"
+    volumes:
+      - .:/workspace/client
+      - ../shared:/workspace/client/shared
+    working_dir: /workspace/client
+    # Dedicated target dir: the native services build with rust:slim (root-owned
+    # target/), so the wasm build (spacetime image, a different toolchain + the
+    # wasm32 target) gets its OWN `target-wasm/` to avoid a cross-toolchain /
+    # cross-owner clash. wasm-bindgen-cli installs under it too.
+    environment:
+      CARGO_TARGET_DIR: /workspace/client/target-wasm
+      PATH: /workspace/client/target-wasm/wasm-tools/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      WASM_BINDGEN_VERSION: "0.2.123"
+    entrypoint: ["bash", "-euo", "pipefail", "-c"]
+    command:
+      - |
+        if ! command -v wasm-bindgen >/dev/null 2>&1; then
+          cargo install wasm-bindgen-cli \
+            --version "$$WASM_BINDGEN_VERSION" \
+            --root /workspace/client/target-wasm/wasm-tools \
+            --locked
+        fi
+        cargo build -p resonantdust-client --lib --target wasm32-unknown-unknown --release
+        wasm-bindgen \
+          target-wasm/wasm32-unknown-unknown/release/resonantdust_client.wasm \
+          --target web \
+          --out-dir pkg

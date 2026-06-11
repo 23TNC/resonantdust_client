@@ -1,0 +1,36 @@
+[package]
+name = "resonantdust-client"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Resonant Dust client WASM wrapper — the view-facing browser surface: the synchronous web-sys WebSocket `WasmClient` + the `render_region` render feed (incl. presentation synthesis like trees-as-cards). Depends on `resonantdust-client-core` for all game logic; this crate is the ONLY place render/graphics-facing code lives, so the headless NPC core can't link it."
+
+# cdylib for wasm-bindgen. The lib NAME stays `resonantdust_client` so the built
+# artifact (and the view's import path `./wasm/resonantdust_client.js`) is unchanged
+# by the core/wasm split.
+[lib]
+name = "resonantdust_client"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The pure game-logic core (sans-IO Client, world mirror, content/zones helpers).
+resonantdust-client-core = { path = "../core" }
+# Named directly by the render feed + transport: codec bit-fields + wire protocol.
+resonantdust-codec = { path = "../shared/codec" }
+resonantdust-protocol = { path = "../shared/protocol" }
+serde_json = "1"
+
+# ── wasm (browser) surface ─────────────────────────────────────────────────
+# The wasm core is SYNCHRONOUS: web-sys `WebSocket.send` is sync + `onmessage` is a
+# callback, so no async runtime is pulled — the one async step (content fetch)
+# happens in JS, which hands the parsed bundle to `load_content`.
+wasm-bindgen = "0.2.122"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+  "WebSocket",
+  "MessageEvent",
+  "Event",
+  "CloseEvent",
+  "BinaryType",
+  "console",
+] }
