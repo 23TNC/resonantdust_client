@@ -47,6 +47,9 @@ pub struct WasmClient {
     /// Set when a card/zone row changed since the last `pump`, so the worker
     /// re-emits the active render region.
     changed: bool,
+    /// The new content version if the gate broadcast a `content_changed` since
+    /// the last drain — the worker reloads the bundle + tells the main thread.
+    content_changed: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -61,6 +64,7 @@ impl WasmClient {
             _onmessage: None,
             _onopen: None,
             changed: false,
+            content_changed: None,
         }
     }
 
@@ -186,11 +190,12 @@ impl WasmClient {
         for raw in frames {
             if let Ok(msg) = serde_json::from_str::<GateMsg>(&raw) {
                 for ev in self.core.apply(msg) {
-                    if matches!(
-                        ev,
-                        Event::CardUpserted { .. } | Event::CardRemoved { .. } | Event::ZoneUpserted { .. }
-                    ) {
-                        self.changed = true;
+                    match ev {
+                        Event::CardUpserted { .. }
+                        | Event::CardRemoved { .. }
+                        | Event::ZoneUpserted { .. } => self.changed = true,
+                        Event::ContentChanged { version } => self.content_changed = Some(version),
+                        _ => {}
                     }
                 }
             }
@@ -201,6 +206,14 @@ impl WasmClient {
         let out = self.core.drain_outbound();
         self.send(&out);
         std::mem::take(&mut self.changed)
+    }
+
+    /// The new content version if the gate hot-swapped its corpus since the last
+    /// call, else `undefined`. Drains the flag — the worker calls this each pump
+    /// and, on `Some`, re-fetches `/content`, reloads the matching bundle, and
+    /// tells the main thread to refresh its render-side `Content`/`Locales`.
+    pub fn take_content_changed(&mut self) -> Option<String> {
+        self.content_changed.take()
     }
 
     /// The renderables in a region of `surface` centred on hex `(center_q,

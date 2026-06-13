@@ -122,6 +122,10 @@ pub enum Event {
     CallErr { cid: u32, error: String },
     /// A protocol-level error, or a row we couldn't decode.
     Error { error: String },
+    /// The gate hot-swapped its content corpus (a new `.rd`/locale version). The
+    /// driver re-fetches `/content`, reloads the matching bundle, and refreshes
+    /// content-derived render state. Carries the new version fingerprint.
+    ContentChanged { version: String },
 }
 
 /// A recipe the matcher found applicable to a board state, with the `bindings`
@@ -1573,8 +1577,9 @@ impl Client {
             }
             GateMsg::Row { table, op, row, .. } => self.apply_row(&table, op, row),
             // Content hot-swap broadcast — definitions changed gate-side. No card
-            // state to fold; a future definition cache would refresh here.
-            GateMsg::ContentChanged { .. } => vec![],
+            // state to fold here; the driver reloads the bundle + refreshes
+            // content-derived render state off this event.
+            GateMsg::ContentChanged { version } => vec![Event::ContentChanged { version }],
             // Live observer count for a zone. Store it (drives the move-sync gate),
             // and on a ≤1→>1 transition flush any dirty cards in that zone so the
             // newly-arrived observer sees their true positions.
