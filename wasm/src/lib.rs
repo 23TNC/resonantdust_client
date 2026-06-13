@@ -157,6 +157,32 @@ impl WasmClient {
         }
     }
 
+    /// Upload an edited master texture channel to the gate (art editor "save
+    /// master"). `data_b64` is the standard-base64 PNG; the gate writes it to the
+    /// texture R2 bucket at `textures/master/<aspect>/<faction>/<variant>.<channel>.png`.
+    /// Fire-and-forget — gated server-side on the content-author capability;
+    /// success/failure is logged gate-side.
+    pub fn upload_master(
+        &mut self,
+        aspect: &str,
+        faction: &str,
+        variant: &str,
+        channel: &str,
+        data_b64: &str,
+    ) {
+        let frames = self.core.dispatch(Command::Call {
+            reducer: "upload_master".to_string(),
+            args: serde_json::json!({
+                "aspect": aspect,
+                "faction": faction,
+                "variant": variant,
+                "channel": channel,
+                "data": data_b64,
+            }),
+        });
+        self.send(&frames);
+    }
+
     /// The assigned player id, or `-1` before login resolves.
     pub fn player_id(&self) -> i32 {
         self.core.player_id().map(|x| x as i32).unwrap_or(-1)
