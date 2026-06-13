@@ -699,6 +699,24 @@ impl ZoneManager {
         self.requested.remove(&zone);
     }
 
+    /// Re-arm a previously-rejected `ensure_region` / `request_zone` for `zone`:
+    /// clear its one-shot dedup (`ensured_regions` / `requested`) so
+    /// [`maybe_request`] re-emits the intent. The driver calls this after a gate
+    /// `time_drift` rejection, once it has re-seated the clock — without it the
+    /// dedup permanently suppresses the re-fire and the zone never materializes.
+    /// No-op if the zone is no longer wanted (the anchor moved off it before the
+    /// backed-off retry fired).
+    pub fn retry_request(&mut self, zone: u64) {
+        let (region, _bit) = region_of_zone(zone);
+        let wanted = self.region_wanted.get(&region).is_some_and(|s| s.contains(&zone));
+        if !wanted {
+            return;
+        }
+        self.ensured_regions.remove(&region);
+        self.requested.remove(&zone);
+        self.maybe_request(zone);
+    }
+
     #[allow(dead_code)]
     pub fn is_zone_present(&self, zone: u64) -> bool {
         let (region, bit) = region_of_zone(zone);

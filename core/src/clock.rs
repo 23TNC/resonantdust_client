@@ -51,6 +51,11 @@ pub struct ClockSync {
     running_delay: f64,
     /// The backward lag applied to `server_now_ms` (= clamp(2·running_delay)).
     client_delay: f64,
+    /// The last instantaneous prediction error fed through [`note_sample`]
+    /// (`extrapolation + running_delta − server`). Diagnostic only — the debug
+    /// HUD's "Delta" readout. `None` until the second sample (the first has no
+    /// anchor to predict against).
+    last_delta: Option<f64>,
 }
 
 impl Default for ClockSync {
@@ -60,6 +65,7 @@ impl Default for ClockSync {
             running_delta: 0.0,
             running_delay: RUNNING_DELAY_INIT_MS,
             client_delay: CLIENT_DELAY_INIT_MS,
+            last_delta: None,
         }
     }
 }
@@ -97,6 +103,7 @@ impl ClockSync {
                 return;
             }
             let delta = (extrapolation + self.running_delta) - server_ms;
+            self.last_delta = Some(delta);
             if delta.abs() > self.running_delay / 2.0 {
                 self.running_delay += (delta.abs() - self.running_delay) / 2.0;
                 self.client_delay =
@@ -124,6 +131,63 @@ impl ClockSync {
     /// Whether at least one sample has landed (so `server_now_ms` is meaningful).
     pub fn is_synced(&self) -> bool {
         !self.captures.is_empty()
+    }
+
+    // ── Diagnostics (the debug HUD's "sync" tab) ─────────────────────────────
+    // Raw state read-outs. None of these feed the estimate — they exist so the
+    // view can surface the clock discipline's internal state.
+
+    /// The backward lag applied to the estimate (`server_now_ms` runs this far
+    /// behind true server time). Debug readout "Client delay".
+    pub fn client_delay_ms(&self) -> f64 {
+        self.client_delay
+    }
+
+    /// Tracked jitter magnitude. Debug readout "Running delay".
+    pub fn running_delay_ms(&self) -> f64 {
+        self.running_delay
+    }
+
+    /// Feedback-controlled offset correction. Debug readout "Running delta".
+    pub fn running_delta_ms(&self) -> f64 {
+        self.running_delta
+    }
+
+    /// The last instantaneous prediction error (`None` until ≥2 samples).
+    pub fn last_delta_ms(&self) -> Option<f64> {
+        self.last_delta
+    }
+
+    /// Number of captures currently in the sample window (0..=`SAMPLE_WINDOW`).
+    pub fn capture_count(&self) -> usize {
+        self.captures.len()
+    }
+
+    /// Per-capture freshness spread, centred on the window mean: `(best, worst)`
+    /// in ms, where each capture's raw offset is `server_ms − perf_ms` (larger =
+    /// fresher / less-queued; the anchor is the max). Returned as deviations from
+    /// the mean so the magnitudes are small + signed — `best` ≥ 0 (the freshest
+    /// sample), `worst` ≤ 0 (the most-queued). `None` until the first sample. The
+    /// debug HUD shows these as "Best/Worst capture" and their gap as "Capture
+    /// spread".
+    pub fn offset_extremes(&self) -> Option<(f64, f64)> {
+        if self.captures.is_empty() {
+            return None;
+        }
+        let n = self.captures.len() as f64;
+        let mean = self.captures.iter().map(|c| c.server_ms - c.perf_ms).sum::<f64>() / n;
+        let mut best = f64::NEG_INFINITY;
+        let mut worst = f64::INFINITY;
+        for c in &self.captures {
+            let off = (c.server_ms - c.perf_ms) - mean;
+            if off > best {
+                best = off;
+            }
+            if off < worst {
+                worst = off;
+            }
+        }
+        Some((best, worst))
     }
 
     /// Re-seat the clock after a gate `time_drift` rejection. `ahead` = the

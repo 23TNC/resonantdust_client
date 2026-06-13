@@ -126,6 +126,10 @@ pub enum Event {
     /// driver re-fetches `/content`, reloads the matching bundle, and refreshes
     /// content-derived render state. Carries the new version fingerprint.
     ContentChanged { version: String },
+    /// A chat message landed on the `chat_messages` feed. The row is also buffered
+    /// for [`drain_chat`](Self::drain_chat); the event lets a driver know the chat
+    /// changed (the wasm pump flags a chat drain) without inspecting the buffer.
+    ChatReceived { sent_at: u64 },
 }
 
 /// A recipe the matcher found applicable to a board state, with the `bindings`
@@ -162,6 +166,40 @@ impl RecipeMatch {
         let bound = self.bindings.iter().flatten().filter(|&&id| id != 0).count();
         (self.input_count, bound)
     }
+}
+
+/// Clock-discipline + RTT diagnostics snapshot for the debug HUD. Produced by
+/// [`Client::clock_stats`]; serialized straight to the view's `SyncStats` shape
+/// (camelCase). The view augments it with the `Date.now()`-relative `dateNowMs`
+/// / `offsetMs` it computes itself. `Option` fields are `None` (→ "—" in the
+/// HUD) until the first server-time sample has landed.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockStats {
+    /// Current server-time estimate (ms since epoch) — runs `client_delay` behind.
+    pub server_now_ms: u64,
+    /// Whether ≥1 sample has landed (else every estimate/extreme is meaningless).
+    pub synced: bool,
+    /// Backward buffer applied to the estimate ("Client delay").
+    pub client_delay_ms: f64,
+    /// Tracked jitter magnitude ("Running delay").
+    pub running_delay_ms: f64,
+    /// Feedback offset correction ("Running delta").
+    pub running_delta_ms: f64,
+    /// Last instantaneous prediction error ("Delta"); `None` until ≥2 samples.
+    pub delta_ms: Option<f64>,
+    /// Captures in the sample window.
+    pub captures: u32,
+    /// Freshest sample's offset deviation from the window mean ("Best capture").
+    pub best_offset_ms: Option<f64>,
+    /// Most-queued sample's offset deviation ("Worst capture").
+    pub worst_offset_ms: Option<f64>,
+    /// Most recent call round-trip time ("RTT"); `None` until a call resolves.
+    pub rtt_ms: Option<f64>,
+    /// Best (min) round-trip time observed ("RTT (best)").
+    pub best_rtt_ms: Option<f64>,
+    /// Number of RTT samples folded so far.
+    pub rtt_samples: u32,
 }
 
 /// The client core: world model + id/clock/session state, driven by
@@ -218,6 +256,21 @@ pub struct Client {
     /// clock at the call's true send instant via the RTT midpoint — not the
     /// current clock. Cleared on the call's reply.
     inflight_calls: HashMap<u32, (f64, u64)>,
+    /// Round-trip-time diagnostics, measured as `reply_perf − send_perf` on each
+    /// resolved `cid`: `(last, best, samples)`. Debug HUD only — RTT does not feed
+    /// the clock estimate (that re-seats off `server_micros` / `time_drift`).
+    rtt: (Option<f64>, Option<f64>, u32),
+    /// In-flight `ensure_region` / `request_zone` calls → their target `zone`, so
+    /// a `time_drift` rejection can re-arm exactly that materialization (the
+    /// `zones` dedup otherwise blocks any re-fire). Cleared on the call's reply.
+    zone_calls: HashMap<u32, u64>,
+    /// Per-zone `time_drift` retry counter for the above, bounded by
+    /// [`MAX_TIME_DRIFT_RETRIES`]; cleared on success or when exhausted.
+    zone_retry_attempt: HashMap<u64, u32>,
+    /// Backed-off zone re-requests: `(zone, ready_perf_ms)`. [`tick`](Self::tick)
+    /// drains those whose back-off has elapsed (clock re-seated by `note_drift`),
+    /// re-arming them in `zones` so [`zone_frames`](Self::zone_frames) re-emits.
+    zone_retries: Vec<(u64, f64)>,
     /// Chain roots whose board state changed since the last match pass — the
     /// dirty set. Re-identification is **budgeted** ([`MATCH_BUDGET_MS`]): card
     /// rows mark their root dirty here and [`tick`](Self::tick) drains the set at
@@ -282,6 +335,26 @@ pub struct Client {
     /// `observers > 1` is in shared space and must sync immediately; `≤ 1` stays
     /// client-local. Commit-based position, Phase 2 ([[project_card_position_sync]]).
     zone_observers: HashMap<u64, u32>,
+    /// Chat messages folded from the `chat_messages` subscription since the last
+    /// [`drain_chat`](Self::drain_chat). The chat feed is NOT world state (it
+    /// joins no card/zone) — it's an append-only side channel the front-end pulls
+    /// and renders. Insert-only in practice (the shard's retention sweep deletes,
+    /// but the client just lets old rows scroll off rather than tracking deletes).
+    chat_inbox: Vec<ChatMsg>,
+    /// Whether the `chat_messages` subscription has been issued — keeps
+    /// [`subscribe_chat`](Self::subscribe_chat) idempotent across logins/pumps.
+    chat_subscribed: bool,
+}
+
+/// One chat message folded from the `chat_messages` table — the front-end's chat
+/// row. Mirrors the chat shard's `ChatMessage`; `sent_at` is the packed
+/// `[time_ms: u48 | seq: u16]` PK (chronological when sorted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatMsg {
+    pub sent_at: u64,
+    pub sender_player_id: u32,
+    pub sender_name: String,
+    pub body: String,
 }
 
 /// Precomputed matcher metadata for one recipe — the recipe index entry. Built
@@ -329,6 +402,10 @@ impl Default for Client {
             player_souls: HashSet::new(),
             souls: HashMap::new(),
             inflight_calls: HashMap::new(),
+            rtt: (None, None, 0),
+            zone_calls: HashMap::new(),
+            zone_retry_attempt: HashMap::new(),
+            zone_retries: Vec::new(),
             dirty_roots: HashSet::new(),
             last_match_perf: 0.0,
             magnet_deadlines: HashMap::new(),
@@ -344,6 +421,8 @@ impl Default for Client {
             pending_promotions: Vec::new(),
             movements: HashMap::new(),
             zone_observers: HashMap::new(),
+            chat_inbox: Vec::new(),
+            chat_subscribed: false,
         }
     }
 }
@@ -384,6 +463,33 @@ impl Client {
     /// The last-sampled server clock (ms).
     pub fn clock_ms(&self) -> u64 {
         self.clock_ms
+    }
+
+    /// A snapshot of the clock-discipline + RTT diagnostics for the debug HUD.
+    /// All ms. `synced` is false (and the `Option` fields `None`) until the first
+    /// server-time sample lands — the view shows "—" then. The view adds the
+    /// `Date.now()`-relative fields (it owns wall-clock); the core only knows its
+    /// server estimate + internal discipline state.
+    pub fn clock_stats(&self) -> ClockStats {
+        let (best_offset, worst_offset) = match self.clock.offset_extremes() {
+            Some((b, w)) => (Some(b), Some(w)),
+            None => (None, None),
+        };
+        let (rtt, best_rtt, rtt_samples) = self.rtt;
+        ClockStats {
+            server_now_ms: self.clock_ms,
+            synced: self.clock.is_synced(),
+            client_delay_ms: self.clock.client_delay_ms(),
+            running_delay_ms: self.clock.running_delay_ms(),
+            running_delta_ms: self.clock.running_delta_ms(),
+            delta_ms: self.clock.last_delta_ms(),
+            captures: self.clock.capture_count() as u32,
+            best_offset_ms: best_offset,
+            worst_offset_ms: worst_offset,
+            rtt_ms: rtt,
+            best_rtt_ms: best_rtt,
+            rtt_samples,
+        }
     }
 
     /// The zone subsystem (read-only) — anchors, tiers, the active search scope.
@@ -528,6 +634,46 @@ impl Client {
         }
     }
 
+    /// Subscribe to the world chat feed (`SELECT * FROM chat_messages`). Idempotent
+    /// — only the first call emits a `Sub`; later calls (re-login, re-pump) no-op.
+    /// No filter: the shard's 1-hour retention sweep bounds the backlog, so a fresh
+    /// subscriber gets up to an hour of recent scrollback and then live messages.
+    /// Inbound rows land in [`drain_chat`](Self::drain_chat) and emit
+    /// [`Event::ChatReceived`].
+    pub fn subscribe_chat(&mut self) -> Vec<ClientMsg> {
+        if self.chat_subscribed {
+            return vec![];
+        }
+        self.chat_subscribed = true;
+        vec![ClientMsg::Sub {
+            sid: self.sid(),
+            table: "chat_messages".to_string(),
+            filter: None,
+        }]
+    }
+
+    /// Send a chat message to the world feed via the `send_chat_message` reducer.
+    /// The sender id/name are filled from our session (`player_id` + login `name`);
+    /// the shard validates + trims `body`. Fire-and-forget — the message arrives
+    /// back through our own `chat_messages` subscription like everyone else's.
+    pub fn send_chat(&mut self, body: String) -> Vec<ClientMsg> {
+        vec![ClientMsg::Call {
+            cid: self.cid(),
+            reducer: "send_chat_message".to_string(),
+            args: serde_json::json!({
+                "sender_player_id": self.player_id.unwrap_or(0),
+                "sender_name": self.name.clone().unwrap_or_default(),
+                "body": body,
+            }),
+        }]
+    }
+
+    /// Take the chat messages folded since the last drain (chronological by arrival;
+    /// sort by `sent_at` for strict order). The front-end appends these to its feed.
+    pub fn drain_chat(&mut self) -> Vec<ChatMsg> {
+        std::mem::take(&mut self.chat_inbox)
+    }
+
     /// Drain the zone subsystem's pending intents into outbound frames, tracking
     /// the sids so a subscription-class change can tear down the old scoped subs
     /// first. Call this after any [`Command::SetAnchor`] (dispatch does it for
@@ -581,6 +727,7 @@ impl Client {
                 }
                 ZoneIntent::RequestZone { zone } => {
                     let cid = self.cid();
+                    self.zone_calls.insert(cid, zone);
                     out.push(ClientMsg::Call {
                         cid,
                         reducer: "request_zone".to_string(),
@@ -592,6 +739,7 @@ impl Client {
                 }
                 ZoneIntent::EnsureRegion { zone } => {
                     let cid = self.cid();
+                    self.zone_calls.insert(cid, zone);
                     out.push(ClientMsg::Call {
                         cid,
                         reducer: "ensure_region".to_string(),
@@ -1561,6 +1709,11 @@ impl Client {
             GateMsg::CallOk { cid, server_micros } => {
                 let mut out = self.sample_clock(&server_micros);
                 self.resolve_action(cid, None);
+                // The region/zone materialized server-side — clear its retry state.
+                if let Some(zone) = self.zone_calls.remove(&cid) {
+                    self.zone_retry_attempt.remove(&zone);
+                }
+                self.record_rtt(cid);
                 self.inflight_calls.remove(&cid);
                 out.push(Event::CallOk { cid });
                 out
@@ -1571,6 +1724,14 @@ impl Client {
                 self.note_drift(cid, &error);
                 let mut out = self.sample_clock(&server_micros);
                 self.resolve_action(cid, Some(&error));
+                // A rejected `ensure_region`/`request_zone` is fire-and-forget with
+                // a dedup that blocks re-fire, so it would never recover on its own.
+                // Re-calc (note_drift above) + back off + re-request — the fix for
+                // neighbour regions never materializing under clock skew (alpha).
+                if let Some(zone) = self.zone_calls.remove(&cid) {
+                    self.schedule_zone_retry(zone, &error);
+                }
+                self.record_rtt(cid);
                 self.inflight_calls.remove(&cid);
                 out.push(Event::CallErr { cid, error });
                 out
@@ -1618,6 +1779,23 @@ impl Client {
         self.perf_ms = perf_ms;
         if self.clock.is_synced() {
             self.clock_ms = self.clock.server_now_ms(perf_ms).max(0.0) as u64;
+        }
+        // Re-arm backed-off zone/region materializations whose drift window has
+        // passed (clock since re-seated). `retry_request` clears the `zones` dedup
+        // so `zone_frames` (drained later this pump) re-emits the call.
+        if !self.zone_retries.is_empty() {
+            let mut due: Vec<u64> = Vec::new();
+            self.zone_retries.retain(|(zone, ready)| {
+                if perf_ms >= *ready {
+                    due.push(*zone);
+                    false
+                } else {
+                    true
+                }
+            });
+            for zone in due {
+                self.zones.retry_request(zone);
+            }
         }
         // Promotion kick: future rows that have come due re-mark their chain root
         // dirty (no Insert fires on promotion, so the matcher would otherwise never
@@ -1994,6 +2172,32 @@ impl Client {
         }
     }
 
+    /// A rejected `ensure_region`/`request_zone` reply: on a `time_drift` reject,
+    /// back off past the drift gap and re-arm the zone (bounded by
+    /// [`MAX_TIME_DRIFT_RETRIES`]); `tick` re-fires it once the back-off elapses,
+    /// with the clock already re-seated by `note_drift`. Non-drift errors drop it
+    /// (mirrors the action path — a non-clock reject won't fix itself by resending).
+    fn schedule_zone_retry(&mut self, zone: u64, error: &str) {
+        if !error.contains("time_drift") {
+            self.zone_retry_attempt.remove(&zone);
+            return;
+        }
+        let n = self.zone_retry_attempt.entry(zone).or_insert(0);
+        if *n >= MAX_TIME_DRIFT_RETRIES {
+            self.zone_retry_attempt.remove(&zone);
+            return;
+        }
+        *n += 1;
+        // Wait out the named drift gap (+ pad), same shape as the action retry.
+        let gap = error
+            .split("client_ahead_by=")
+            .nth(1)
+            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        self.zone_retries.push((zone, self.perf_ms + gap + TIME_DRIFT_RETRY_PAD_MS));
+    }
+
     /// Drain the final outcomes of fired queued actions: `(recipe, Err(reason)?)`.
     /// A driver/harness uses this to distinguish a real accept (`None`) from a
     /// silent drop on rejection (`Some(reason)`) — the queue empties on both.
@@ -2062,6 +2266,22 @@ impl Client {
             }
             Err(_) => vec![],
         }
+    }
+
+    /// Fold a resolved call's round-trip time (`reply_perf − send_perf`) into the
+    /// RTT diagnostics. Called on `call_ok`/`call_err` BEFORE the `cid` is reaped
+    /// from `inflight_calls`. A non-positive sample (clock not yet ticked, or a
+    /// reaped entry) is ignored.
+    fn record_rtt(&mut self, cid: u32) {
+        let Some(&(send_perf, _)) = self.inflight_calls.get(&cid) else { return };
+        let rtt = self.perf_ms - send_perf;
+        if rtt <= 0.0 {
+            return;
+        }
+        let (last, best, samples) = &mut self.rtt;
+        *last = Some(rtt);
+        *best = Some(best.map_or(rtt, |b| b.min(rtt)));
+        *samples += 1;
     }
 
     /// Parse a gate `time_drift:client_(ahead|behind)_by=N` reply for call `cid`
@@ -2223,6 +2443,40 @@ impl Client {
                         vec![Event::PlayerId { id: pid }]
                     }
                     _ => vec![],
+                }
+            }
+            "chat_messages" => {
+                // Append-only side feed — not world state. The gate camelCases keys
+                // and stringifies numbers (u64 `sent_at` would lose precision as a
+                // JSON number), so pull each field by its wire name. Deletes (the
+                // shard's retention sweep) just stop arriving in the buffer; the
+                // front-end lets old rows scroll off, so we only fold inserts.
+                if !matches!(op, RowOp::Insert) {
+                    return vec![];
+                }
+                let sent_at = row
+                    .get("sentAt")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok());
+                let sender_player_id = row
+                    .get("senderPlayerId")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u32>().ok());
+                let sender_name = row.get("senderName").and_then(|v| v.as_str());
+                let body = row.get("body").and_then(|v| v.as_str());
+                match (sent_at, sender_player_id, sender_name, body) {
+                    (Some(sent_at), Some(sender_player_id), Some(sender_name), Some(body)) => {
+                        self.chat_inbox.push(ChatMsg {
+                            sent_at,
+                            sender_player_id,
+                            sender_name: sender_name.to_string(),
+                            body: body.to_string(),
+                        });
+                        vec![Event::ChatReceived { sent_at }]
+                    }
+                    _ => vec![Event::Error {
+                        error: "chat_messages row decode: missing/!str field".to_string(),
+                    }],
                 }
             }
             _ => vec![],
@@ -2816,6 +3070,94 @@ mod tests {
         // A second identical region update does not re-request (requested set).
         c.apply(region_row_frame(RowOp::Update, region, u64::MAX, 0));
         assert_eq!(count_call(&c.zone_frames(), "request_zone"), 0, "no duplicate requests");
+    }
+
+    #[test]
+    fn time_drift_rejected_ensure_region_retries_after_backoff() {
+        use resonantdust_codec::packed::WORLD_LAYER;
+        let mut c = Client::new();
+        // Anchor → fires one ensure_region for the (still-unknown) region.
+        let frames = c.dispatch(Command::SetAnchor {
+            name: "soul".to_string(),
+            surface: WORLD_LAYER,
+            owner: 0,
+            q: 16,
+            r: 16,
+            radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
+        });
+        assert_eq!(count_call(&frames, "ensure_region"), 1);
+        let cid = frames
+            .iter()
+            .find_map(|f| match f {
+                ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
+                _ => None,
+            })
+            .expect("ensure_region cid");
+
+        // The gate rejects it as client-ahead (clock skew). Before the fix the
+        // dedup would suppress any re-fire and the region would never materialize.
+        let _ = c.apply(GateMsg::CallErr {
+            cid,
+            error: "time_drift:client_ahead_by=500 (server=1, client=501)".to_string(),
+            server_micros: String::new(),
+        });
+        // No immediate re-fire — it's backed off (gap 500 + pad 250 = 750ms).
+        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "no immediate re-fire");
+        c.tick(400.0);
+        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "held during backoff");
+        // Past the backoff: re-armed and re-emitted exactly once.
+        c.tick(800.0);
+        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 1, "re-requested after backoff");
+    }
+
+    #[test]
+    fn time_drift_retry_is_bounded() {
+        use resonantdust_codec::packed::WORLD_LAYER;
+        let mut c = Client::new();
+        let frames = c.dispatch(Command::SetAnchor {
+            name: "soul".to_string(),
+            surface: WORLD_LAYER,
+            owner: 0,
+            q: 16,
+            r: 16,
+            radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
+        });
+        // Reject, re-arm, re-fire — MAX_TIME_DRIFT_RETRIES times, then give up.
+        let mut perf = 0.0;
+        let mut cid = frames
+            .iter()
+            .find_map(|f| match f {
+                ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
+                _ => None,
+            })
+            .unwrap();
+        for _ in 0..MAX_TIME_DRIFT_RETRIES {
+            c.apply(GateMsg::CallErr {
+                cid,
+                error: "time_drift:client_ahead_by=100".to_string(),
+                server_micros: String::new(),
+            });
+            perf += 1000.0;
+            c.tick(perf);
+            let frames = c.zone_frames();
+            assert_eq!(count_call(&frames, "ensure_region"), 1, "re-fires within the retry budget");
+            cid = frames
+                .iter()
+                .find_map(|f| match f {
+                    ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
+                    _ => None,
+                })
+                .unwrap();
+        }
+        // Budget exhausted: the next rejection drops it (no further re-fire).
+        c.apply(GateMsg::CallErr {
+            cid,
+            error: "time_drift:client_ahead_by=100".to_string(),
+            server_micros: String::new(),
+        });
+        perf += 1000.0;
+        c.tick(perf);
+        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "stops after the budget");
     }
 
     #[test]

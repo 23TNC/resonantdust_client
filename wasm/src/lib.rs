@@ -18,8 +18,8 @@ use web_sys::{MessageEvent, WebSocket};
 
 use resonantdust_codec::card_model::Micro;
 use resonantdust_codec::packed::{
-    pack_definition, surface_of, tile_full, tile_slot, unpack_macro_zone, unpack_zone_definition,
-    world_tile, ZONE_SIZE,
+    pack_definition, pack_macro_zone_full, surface_of, tile_full, tile_slot, unpack_macro_zone,
+    unpack_zone_definition, world_tile, zone_local, INVENTORY_LAYER, ZONE_SIZE,
 };
 use resonantdust_protocol::protocol::{ClientMsg, GateMsg};
 
@@ -157,6 +157,47 @@ impl WasmClient {
         }
     }
 
+    /// Create a new card via `create_card` — the chat `/give` path. `owner` owns
+    /// the new card; `card_key` is the content def id (e.g. `"corpus"`); the new
+    /// card lands in `zone_owner`'s `surface` zone (the gate resolves the def +
+    /// stock; the shard places it).
+    ///
+    /// Placement: when `world_q/world_r` are `0,0` AND `zone_owner == owner`, send
+    /// `macro_zone = 0` so the SHARD auto-places into the default bucket
+    /// (`first_free_cell` — collision-free; this is `/give 1025 corpus` → first
+    /// empty inventory slot). Otherwise resolve the global cell to an explicit
+    /// `macro_zone` + local cell (world zones are owned by `0`, inventory zones by
+    /// the container card) and place there (exact snap, no collision avoidance).
+    pub fn give(
+        &mut self,
+        owner: u32,
+        card_key: &str,
+        zone_owner: u32,
+        surface: u8,
+        world_q: i32,
+        world_r: i32,
+    ) {
+        let (macro_zone, q, r) = if zone_owner == owner && world_q == 0 && world_r == 0 {
+            (0u64, 0u8, 0u8)
+        } else {
+            // World surfaces are one shared grid owned by `0`; inventory/pocket
+            // zones are owned by the container card.
+            let zo = if surface == INVENTORY_LAYER { zone_owner } else { 0 };
+            let (zq, lq) = zone_local(world_q);
+            let (zr, lr) = zone_local(world_r);
+            (pack_macro_zone_full(zo, surface, zq, zr), lq, lr)
+        };
+        let frames = self.core.dispatch(Command::CreateCard {
+            owner,
+            card_key: card_key.to_string(),
+            surface,
+            macro_zone,
+            q,
+            r,
+        });
+        self.send(&frames);
+    }
+
     /// Upload an edited master texture channel to the gate (art editor "save
     /// master"). `data_b64` is the standard-base64 PNG; the gate writes it to the
     /// texture R2 bucket at `textures/master/<aspect>/<faction>/<variant>.<channel>.png`.
@@ -181,6 +222,89 @@ impl WasmClient {
             }),
         });
         self.send(&frames);
+    }
+
+    /// Author a NEW version of an existing `.rd` source (art editor "save DSL").
+    /// `lineage` is the source name the gate tracks; `text` is the full file. The
+    /// authority validates + hot-swaps + persists to R2, then broadcasts
+    /// `content_changed`. Fire-and-forget — gated on the content-author capability.
+    pub fn modify_content(&mut self, lineage: &str, text: &str) {
+        let frames = self.core.dispatch(Command::Call {
+            reducer: "modify_content".to_string(),
+            args: serde_json::json!({ "lineage": lineage, "text": text }),
+        });
+        self.send(&frames);
+    }
+
+    /// Author a brand-new `.rd` source named `name` with `text` (a card that
+    /// shipped no source for this facet). Same authority validate + hot-swap +
+    /// persist + `content_changed` as `modify_content`.
+    pub fn add_content(&mut self, name: &str, text: &str) {
+        let frames = self.core.dispatch(Command::Call {
+            reducer: "add_content".to_string(),
+            args: serde_json::json!({ "name": name, "text": text }),
+        });
+        self.send(&frames);
+    }
+
+    /// Replace locale `domain`'s JSON (art editor "save locale"). The authority
+    /// validates + hot-swaps + persists + broadcasts `content_changed`. Fire-and-
+    /// forget — gated on the content-author capability.
+    pub fn modify_locale(&mut self, domain: &str, json: &str) {
+        let frames = self.core.dispatch(Command::Call {
+            reducer: "modify_locale".to_string(),
+            args: serde_json::json!({ "domain": domain, "json": json }),
+        });
+        self.send(&frames);
+    }
+
+    /// Replace visuals source `name` (`visuals/…`) with `text` (art editor "save
+    /// visuals"). The authority validates + hot-swaps + persists + broadcasts
+    /// `content_changed`. Fire-and-forget — gated on the content-author capability.
+    pub fn modify_visuals(&mut self, name: &str, text: &str) {
+        let frames = self.core.dispatch(Command::Call {
+            reducer: "modify_visuals".to_string(),
+            args: serde_json::json!({ "name": name, "text": text }),
+        });
+        self.send(&frames);
+    }
+
+    /// Subscribe to the world chat feed. Idempotent — call once login resolved (so
+    /// our sender id/name are known); inbound messages then accumulate for
+    /// [`take_chat`](Self::take_chat). Safe to re-call.
+    pub fn subscribe_chat(&mut self) {
+        let frames = self.core.subscribe_chat();
+        self.send(&frames);
+    }
+
+    /// Send a chat message to the world feed. Sender id/name come from the session;
+    /// the shard trims/validates `body`. Fire-and-forget — it echoes back through
+    /// our own subscription like any other message.
+    pub fn send_chat(&mut self, body: &str) {
+        let frames = self.core.send_chat(body.to_string());
+        self.send(&frames);
+    }
+
+    /// Drain chat messages folded since the last call, as a JSON array of
+    /// `{ sentAt: string, senderPlayerId: number, senderName: string, body: string }`
+    /// (sorted by `sentAt`; `sentAt` is a string because the packed u64 exceeds
+    /// JS's safe-integer range). Empty `[]` when nothing arrived. The worker calls
+    /// this each pump and posts non-empty batches to the chat UI.
+    pub fn take_chat(&mut self) -> String {
+        let mut msgs = self.core.drain_chat();
+        msgs.sort_by_key(|m| m.sent_at);
+        let arr: Vec<serde_json::Value> = msgs
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "sentAt": m.sent_at.to_string(),
+                    "senderPlayerId": m.sender_player_id,
+                    "senderName": m.sender_name,
+                    "body": m.body,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// The assigned player id, or `-1` before login resolves.
@@ -240,6 +364,13 @@ impl WasmClient {
     /// tells the main thread to refresh its render-side `Content`/`Locales`.
     pub fn take_content_changed(&mut self) -> Option<String> {
         self.content_changed.take()
+    }
+
+    /// The clock-discipline + RTT diagnostics as a JSON object (the view's
+    /// `SyncStats` shape, camelCase) for the debug HUD's "sync" tab. The view
+    /// adds the `Date.now()`-relative fields itself. Cheap — call each pump.
+    pub fn clock_stats(&self) -> String {
+        serde_json::to_string(&self.core.clock_stats()).unwrap_or_else(|_| "{}".to_string())
     }
 
     /// The renderables in a region of `surface` centred on hex `(center_q,
