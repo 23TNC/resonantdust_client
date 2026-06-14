@@ -113,6 +113,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // --- `as` handle-binding hook (single-client, alice): spawn an anvil, let
+    // the root-only `forge` create a widget bound `&h as` with its progress stock
+    // folded to 4 and a pip nested inside it. Asserts the fold on the client;
+    // prints the widget id so the tag → id resolution can be confirmed by
+    // querying the shard DB for the pip's owner_id.
+    if std::env::var("AS_SPIKE").is_ok() {
+        if let Some(s) = sessions.first_mut() {
+            let widget = s.run_forge_as().await?;
+            println!("harness: AS_SPIKE widget card_id = {widget}");
+        }
+        println!("harness: AS_SPIKE PASS");
+        return Ok(());
+    }
+
     // --- MOVEMENT test hook (single-client, alice): the single-step "stays until
     // arrival" property, then a pipelined multi-tile walk.
     if std::env::var("MOVE_TEST").is_ok() {

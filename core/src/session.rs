@@ -327,6 +327,70 @@ impl Session {
         Ok(())
     }
 
+    /// Validate `as` handle-binding end-to-end: spawn an `anvil` (root-only
+    /// marker), let the triggered `forge` recipe fire once — it creates a `widget`
+    /// into the owner's inventory bound `&h as`, folds the widget's `progress`
+    /// stock 1→4, and nests a `pip` into the widget. Asserts the widget appears
+    /// owned by us with progress = 4, proving same-card stock FOLDS into the
+    /// Create row (no SetCardStock). Returns the widget's card_id so the caller
+    /// can confirm the nested pip's `owner_id` resolved to it (the shard tag → id
+    /// path) by querying the shard DB — the pip lives in the widget's own
+    /// inventory zone, which the client doesn't subscribe to.
+    pub async fn run_forge_as(&mut self) -> anyhow::Result<u32> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_millis(500)).await?;
+        let anvil_def =
+            self.core.packed_def("anvil").ok_or_else(|| anyhow::anyhow!("[{tag}] no anvil def"))?;
+        let widget_def =
+            self.core.packed_def("widget").ok_or_else(|| anyhow::anyhow!("[{tag}] no widget def"))?;
+        let human = self.core.souls().next().ok_or_else(|| anyhow::anyhow!("[{tag}] no soul"))?;
+        let me = self.player_id().unwrap_or(0);
+
+        // Fresh anvil, loose in the human's inventory — its own chain root, so the
+        // root-only `forge` fires on it.
+        self.send(Command::CreateCard {
+            owner: human,
+            card_key: "anvil".to_string(),
+            surface: INVENTORY_LAYER,
+            macro_zone: 0,
+            q: 0,
+            r: 0,
+        })
+        .await?;
+        self.await_call().await?;
+        if !self
+            .pump_for_state(Duration::from_secs(5), |c| {
+                find_owned_loose(c, anvil_def, me).is_some()
+            })
+            .await?
+        {
+            bail!("[{tag}] anvil never discovered");
+        }
+        println!("[{tag}] anvil spawned; waiting for root-only `forge` to fire ...");
+
+        // `forge` fires (budget ~1/s): a widget appears in our inventory with its
+        // progress folded to 4.
+        let widget_progress = |c: &Client| -> Option<(u32, u32)> {
+            let now = c.clock_ms();
+            find_owned_loose(c, widget_def, me)
+                .and_then(|id| c.world().cards.current(id, now).map(|r| (id, r.stock & 0xFF)))
+        };
+        let mut found = None;
+        for _ in 0..30 {
+            self.pump(Duration::from_millis(500)).await?;
+            if let Some((id, prog)) = widget_progress(&self.core) {
+                found = Some((id, prog));
+                break;
+            }
+        }
+        let (widget, prog) = found.ok_or_else(|| anyhow::anyhow!("[{tag}] forge never created a widget"))?;
+        if prog != 4 {
+            bail!("[{tag}] fold FAILED — expected widget progress 4 (default 1 + abs set 4), got {prog}");
+        }
+        println!("[{tag}] ✓ fold verified — widget {widget} created with progress = 4 (folded into Create)");
+        Ok(widget)
+    }
+
     /// Pump until the next reducer reply lands (CallOk/CallErr).
     async fn await_call(&mut self) -> anyhow::Result<()> {
         self.pump_until(Duration::from_secs(5), |e| {
@@ -895,6 +959,22 @@ impl Session {
         }
         Ok(())
     }
+}
+
+/// The card_id of a live, loose card of `def` owned (transitively) by player
+/// `me`, if any. Shared by the stock/forge scenarios.
+fn find_owned_loose(c: &Client, def: u16, me: u32) -> Option<u32> {
+    let now = c.clock_ms();
+    c.world()
+        .cards
+        .current_all(now)
+        .find(|r| {
+            r.packed_definition == def
+                && !r.is_dead()
+                && matches!(r.micro(), Micro::Loose { .. })
+                && owning_player(c.world(), r.card_id, now) == Some(me)
+        })
+        .map(|r| r.card_id)
 }
 
 /// Drive several sessions together for `budget` so each receives the others'

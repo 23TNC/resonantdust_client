@@ -55,6 +55,7 @@ services:
       - CUT_TREE_SPIKE
       - MOVE_TEST
       - MAGNETIC_SPIKE
+      - AS_SPIKE
     volumes:
       - .:/workspace/client
       - ../shared:/workspace/client/shared
