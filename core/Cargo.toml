@@ -27,6 +27,8 @@ resonantdust-state = { path = "../shared/state" }
 resonantdust-protocol = { path = "../shared/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# GateMsg decode (binary). ClientMsg out is still JSON (serde_json) for now.
+postcard = { version = "1", features = ["alloc"] }
 anyhow = "1"
 
 # ── Native transport (NPC driver + tests) ──────────────────────────────────

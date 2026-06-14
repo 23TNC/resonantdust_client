@@ -30,7 +30,7 @@ use crate::actions::{
     QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, TIME_DRIFT_RETRY_PAD_MS,
 };
 use crate::clock::ClockSync;
-use crate::rows::CardRow;
+use crate::rows::{CardRow, RowData};
 use crate::world::World;
 use crate::zones::{DataType, ZoneIntent, ZoneManager};
 
@@ -1782,7 +1782,7 @@ impl Client {
                 self.inflight_calls.remove(&cid);
                 out
             }
-            GateMsg::Row { table, op, row, .. } => self.apply_row(&table, op, row),
+            GateMsg::Row { op, row, .. } => self.apply_row(op, row),
             // Content hot-swap broadcast — definitions changed gate-side. No card
             // state to fold here; the driver reloads the bundle + refreshes
             // content-derived render state off this event.
@@ -2334,10 +2334,10 @@ impl Client {
         self.clock_ms = self.clock.server_now_ms(self.perf_ms).max(0.0) as u64;
     }
 
-    fn apply_row(&mut self, table: &str, op: RowOp, row: serde_json::Value) -> Vec<Event> {
-        match table {
-            "cards" => match serde_json::from_value::<CardRow>(row) {
-                Ok(mut card) => {
+    fn apply_row(&mut self, op: RowOp, row: RowData) -> Vec<Event> {
+        match row {
+            RowData::Card(mut card) => {
+                {
                     let card_id = card.card_id;
                     // Position reconciliation: when we hold a pending LOCAL move for
                     // this card (`dirty_position`), the server's row still carries the
@@ -2396,10 +2396,9 @@ impl Client {
                     }
                     vec![ev]
                 }
-                Err(e) => vec![Event::Error { error: format!("cards row decode: {e}") }],
-            },
-            "zones" => match serde_json::from_value::<crate::rows::ZoneRow>(row) {
-                Ok(zone) => {
+            }
+            RowData::Zone(zone) => {
+                {
                     let macro_zone = zone.macro_zone;
                     // A row stamped ahead of the buffered clock promotes silently
                     // later — track the earliest so `tick` can kick a re-render then.
@@ -2415,10 +2414,9 @@ impl Client {
                     self.zones.note_update(macro_zone, DataType::Zone, self.clock_ms);
                     vec![Event::ZoneUpserted { macro_zone }]
                 }
-                Err(e) => vec![Event::Error { error: format!("zones row decode: {e}") }],
-            },
-            "regions" => match serde_json::from_value::<crate::rows::RegionRow>(row) {
-                Ok(region) => {
+            }
+            RowData::Region(region) => {
+                {
                     // Feed the region gate. `regions` is current-value (one row per
                     // macro_region, updated in place), so Insert/Update overwrite the
                     // cached bits and a genuine Delete drops them.
@@ -2433,16 +2431,12 @@ impl Client {
                     }
                     vec![]
                 }
-                Err(e) => vec![Event::Error { error: format!("regions row decode: {e}") }],
-            },
-            "players" => {
-                // Learn our player_id from our own row (gate camelCases keys +
-                // stringifies numbers, so `playerId` is a string).
-                let row_name = row.get("name").and_then(|v| v.as_str());
-                let pid = row
-                    .get("playerId")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u32>().ok());
+            }
+            RowData::Player(p) => {
+                // Learn our player_id from our own row by matching name (typed now
+                // — no JSON string-coercion).
+                let row_name = Some(p.name.as_str());
+                let pid = Some(p.player_id);
                 match (row_name, pid) {
                     (Some(rn), Some(pid))
                         if self.name.as_deref() == Some(rn) && self.player_id != Some(pid) =>
@@ -2473,41 +2467,22 @@ impl Client {
                     _ => vec![],
                 }
             }
-            "chat_messages" => {
-                // Append-only side feed — not world state. The gate camelCases keys
-                // and stringifies numbers (u64 `sent_at` would lose precision as a
-                // JSON number), so pull each field by its wire name. Deletes (the
-                // shard's retention sweep) just stop arriving in the buffer; the
-                // front-end lets old rows scroll off, so we only fold inserts.
+            RowData::Chat(c) => {
+                // Append-only side feed — not world state. Deletes (the shard's
+                // retention sweep) just stop arriving in the buffer; the front-end
+                // lets old rows scroll off, so we only fold inserts.
                 if !matches!(op, RowOp::Insert) {
                     return vec![];
                 }
-                let sent_at = row
-                    .get("sentAt")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok());
-                let sender_player_id = row
-                    .get("senderPlayerId")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u32>().ok());
-                let sender_name = row.get("senderName").and_then(|v| v.as_str());
-                let body = row.get("body").and_then(|v| v.as_str());
-                match (sent_at, sender_player_id, sender_name, body) {
-                    (Some(sent_at), Some(sender_player_id), Some(sender_name), Some(body)) => {
-                        self.chat_inbox.push(ChatMsg {
-                            sent_at,
-                            sender_player_id,
-                            sender_name: sender_name.to_string(),
-                            body: body.to_string(),
-                        });
-                        vec![Event::ChatReceived { sent_at }]
-                    }
-                    _ => vec![Event::Error {
-                        error: "chat_messages row decode: missing/!str field".to_string(),
-                    }],
-                }
+                let sent_at = c.sent_at;
+                self.chat_inbox.push(ChatMsg {
+                    sent_at,
+                    sender_player_id: c.sender_player_id,
+                    sender_name: c.sender_name,
+                    body: c.body,
+                });
+                vec![Event::ChatReceived { sent_at }]
             }
-            _ => vec![],
         }
     }
 }
@@ -2775,19 +2750,17 @@ mod tests {
     fn cards_row_frame(op: RowOp, card_id: u32, owner_id: u32, time_ms: u64) -> GateMsg {
         GateMsg::Row {
             sid: 0,
-            table: "cards".to_string(),
             op,
-            old: None,
-            row: serde_json::json!({
-                "validAt": pack_valid_at(time_ms, 1).to_string(),
-                "cardId": card_id.to_string(),
-                "macroZone": "0",
-                "microLocation": "0",
-                "ownerId": owner_id.to_string(),
-                "packedDefinition": "0",
-                "flags": "0",
-                "flagsBk": "0",
-                "stock": "0",
+            row: RowData::Card(CardRow {
+                valid_at: pack_valid_at(time_ms, 1),
+                card_id,
+                macro_zone: 0,
+                micro_location: 0,
+                owner_id,
+                packed_definition: 0,
+                flags: 0,
+                flags_bk: 0,
+                stock: 0,
             }),
         }
     }
@@ -2827,20 +2800,16 @@ mod tests {
         // A players row for someone else is ignored.
         let other = GateMsg::Row {
             sid: 0,
-            table: "players".to_string(),
             op: RowOp::Insert,
-            old: None,
-            row: serde_json::json!({ "playerId": "999", "name": "bob" }),
+            row: RowData::Player(crate::rows::PlayerRow { player_id: 999, name: "bob".to_string() }),
         };
         assert_eq!(c.apply(other), vec![]);
         assert_eq!(c.player_id(), None);
         // Our row sets player_id + emits the event.
         let ours = GateMsg::Row {
             sid: 0,
-            table: "players".to_string(),
             op: RowOp::Insert,
-            old: None,
-            row: serde_json::json!({ "playerId": "1024", "name": "ann" }),
+            row: RowData::Player(crate::rows::PlayerRow { player_id: 1024, name: "ann".to_string() }),
         };
         assert_eq!(c.apply(ours), vec![Event::PlayerId { id: 1024 }]);
         assert_eq!(c.player_id(), Some(1024));
@@ -3025,17 +2994,14 @@ mod tests {
     fn region_row_frame(op: RowOp, macro_region: u64, presence: u64, available: u64) -> GateMsg {
         GateMsg::Row {
             sid: 0,
-            table: "regions".to_string(),
             op,
-            old: None,
-            row: serde_json::json!({
-                "macroRegion": macro_region.to_string(),
-                "zonePresence": presence.to_string(),
-                "zoneAvailable": available.to_string(),
-                // `Region` gained a disk `distance` (u16, str-encoded like the rest);
-                // world rows carry u16::MAX (full disk). The request count keys on the
-                // passed-in presence, so the exact value is immaterial here.
-                "distance": u16::MAX.to_string(),
+            // world rows carry u16::MAX (full disk); the request count keys on the
+            // passed-in presence, so the exact distance is immaterial here.
+            row: RowData::Region(crate::rows::RegionRow {
+                macro_region,
+                zone_presence: presence,
+                zone_available: available,
+                distance: u16::MAX,
             }),
         }
     }
@@ -3169,19 +3135,17 @@ mod tests {
         let (micro_location, flags) = Micro::snap(0, 0).apply(0);
         GateMsg::Row {
             sid: 0,
-            table: "cards".to_string(),
             op: RowOp::Insert,
-            old: None,
-            row: serde_json::json!({
-                "validAt": pack_valid_at(100, 1).to_string(),
-                "cardId": card_id.to_string(),
-                "macroZone": macro_zone.to_string(),
-                "microLocation": micro_location.to_string(),
-                "ownerId": owner_id.to_string(),
-                "packedDefinition": packed_definition.to_string(),
-                "flags": flags.to_string(),
-                "flagsBk": "0",
-                "stock": "0",
+            row: RowData::Card(CardRow {
+                valid_at: pack_valid_at(100, 1),
+                card_id,
+                macro_zone,
+                micro_location,
+                owner_id,
+                packed_definition,
+                flags,
+                flags_bk: 0,
+                stock: 0,
             }),
         }
     }
@@ -3201,10 +3165,8 @@ mod tests {
         // Learn our player_id → queues the player_soul roster sub.
         c.apply(GateMsg::Row {
             sid: 0,
-            table: "players".to_string(),
             op: RowOp::Insert,
-            old: None,
-            row: serde_json::json!({ "playerId": "1000", "name": "ann" }),
+            row: RowData::Player(crate::rows::PlayerRow { player_id: 1000, name: "ann".to_string() }),
         });
         let frames = c.drain_outbound();
         assert!(

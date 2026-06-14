@@ -19,6 +19,8 @@ resonantdust-client-core = { path = "../core" }
 resonantdust-codec = { path = "../shared/codec" }
 resonantdust-protocol = { path = "../shared/protocol" }
 serde_json = "1"
+# GateMsg decode (binary).
+postcard = { version = "1", features = ["alloc"] }
 
 # ── wasm (browser) surface ─────────────────────────────────────────────────
 # The wasm core is SYNCHRONOUS: web-sys `WebSocket.send` is sync + `onmessage` is a

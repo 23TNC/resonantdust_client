@@ -348,10 +348,10 @@ mod tests {
         cards.apply(RowOp::Insert, r1);
         cards.apply(RowOp::Insert, r2);
         // Reap the older version (GC sweep) — newer stays current.
-        cards.apply(RowOp::Delete, loose_row(1024, 100, 7).with_valid_at(v1));
+        cards.apply(RowOp::Delete, with_valid_at(loose_row(1024, 100, 7), v1));
         assert_eq!(cards.current(1024, 250).unwrap().time_ms(), 200);
         // Reap the last version — the card disappears.
-        cards.apply(RowOp::Delete, loose_row(1024, 200, 7).with_valid_at(v2));
+        cards.apply(RowOp::Delete, with_valid_at(loose_row(1024, 200, 7), v2));
         assert!(cards.current(1024, 250).is_none());
         assert!(cards.is_empty());
     }
@@ -382,12 +382,11 @@ mod tests {
 
 }
 
+/// Test helper: clone a row with a specific `valid_at` (so a Delete event can
+/// name the exact version row to reap). A free fn, not an inherent method —
+/// `CardRow` is defined in the protocol crate now (orphan rule).
 #[cfg(test)]
-impl CardRow {
-    /// Test helper: clone with a specific `valid_at` (so a Delete event can name
-    /// the exact version row to reap).
-    fn with_valid_at(mut self, valid_at: u64) -> Self {
-        self.valid_at = valid_at;
-        self
-    }
+fn with_valid_at(mut row: CardRow, valid_at: u64) -> CardRow {
+    row.valid_at = valid_at;
+    row
 }

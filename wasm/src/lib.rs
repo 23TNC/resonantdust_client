@@ -172,8 +172,8 @@ impl SubStats {
     /// subscription (`Applied`); call replies + others are ignored here.
     fn note_inbound(&mut self, msg: &GateMsg, bytes: usize) {
         match msg {
-            GateMsg::Row { table, .. } => {
-                self.by_table.entry(table.clone()).or_default().rx_bytes += bytes as u64;
+            GateMsg::Row { row, .. } => {
+                self.by_table.entry(row.table().to_string()).or_default().rx_bytes += bytes as u64;
             }
             GateMsg::Applied { sid } => {
                 if let Some(table) = self.sid_table.get(sid) {
@@ -520,7 +520,7 @@ impl WasmClient {
         // Drain into a Vec first so the queue borrow is released before `apply`.
         let frames: Vec<Vec<u8>> = self.incoming.borrow_mut().drain(..).collect();
         for raw in frames {
-            if let Ok(msg) = serde_json::from_slice::<GateMsg>(&raw) {
+            if let Ok(msg) = postcard::from_bytes::<GateMsg>(&raw) {
                 // Tally call replies (by cid → reducer) + subscription data (by
                 // table) before `apply` consumes the frame; `raw.len()` is the
                 // rx-bytes estimate.

@@ -41,10 +41,11 @@ impl<T: Transport> GateConnection<T> {
         Ok(())
     }
 
-    /// The next inbound gate frame, parsed — or `None` at EOF.
+    /// The next inbound gate frame, decoded — or `None` at EOF. `GateMsg` is
+    /// postcard (binary); `ClientMsg` (outbound) is still JSON until its own phase.
     pub async fn next(&mut self) -> anyhow::Result<Option<GateMsg>> {
         match self.transport.recv().await? {
-            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
+            Some(raw) => Ok(Some(postcard::from_bytes(&raw)?)),
             None => Ok(None),
         }
     }
@@ -76,8 +77,8 @@ mod tests {
     #[tokio::test]
     async fn serializes_outbound_and_parses_inbound() {
         let mut t = MockTransport::default();
-        t.incoming.push_back(br#"{"t":"time","server_micros":"123"}"#.to_vec());
-        t.incoming.push_back(br#"{"t":"applied","sid":1}"#.to_vec());
+        t.incoming.push_back(GateMsg::Time { server_micros: "123".to_string() }.to_bytes());
+        t.incoming.push_back(GateMsg::Applied { sid: 1 }.to_bytes());
         {
             let mut conn = GateConnection::new(&mut t);
             conn.send_all(&[
