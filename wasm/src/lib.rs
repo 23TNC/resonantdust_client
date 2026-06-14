@@ -27,11 +27,12 @@ use resonantdust_client_core::client::{Client, Command, Event};
 use resonantdust_client_core::content;
 use resonantdust_client_core::zones::AnchorRadii;
 
-/// Lookahead ring (in tiles) the viewport anchor subscribes beyond the visible
-/// region, so a zone's tiles stream in before a pan brings it on screen. Two
-/// zones of margin — enough to cover the subscribe→materialize→stream round-trip
-/// at normal pan speeds.
-const PREFETCH_TILES: i32 = 2 * ZONE_SIZE;
+/// Margin (in TILES) the viewport anchor's `active` disk extends past the visible
+/// region. Just enough to pull in the macro_zones bordering the viewport so they
+/// stream as a pan reaches them — NOT a deep prefetch ring (a 2-zone ring is the
+/// perimeter, which more than doubles the requested zones). The buffered clock
+/// masks the rest.
+const ANCHOR_MARGIN_TILES: i32 = 2;
 
 /// One reducer's running tally for the debug HUD's "calls" tab.
 #[derive(Default)]
@@ -124,6 +125,9 @@ struct TableStat {
     /// Currently-open subscriptions on this table (`Sub` − `Unsub`). Zone/card
     /// subs are one-per-zone, so this climbs with the anchor's coverage.
     active: i32,
+    /// Every `Sub` ever issued for this table — additive, never decremented.
+    /// Divided by `active` it reads the churn (re-subscribe) the anchor drives.
+    total: u32,
     /// Serialized JSON byte size of `Sub`/`Unsub` frames sent (tx) and the
     /// `Row`/`Applied` frames received (rx). ESTIMATES — they ignore WebSocket
     /// framing + any transport compression.
@@ -148,6 +152,7 @@ impl SubStats {
             ClientMsg::Sub { sid, table, .. } => {
                 let e = self.by_table.entry(table.clone()).or_default();
                 e.active += 1;
+                e.total += 1;
                 e.tx_bytes += bytes as u64;
                 self.sid_table.insert(*sid, table.clone());
             }
@@ -189,6 +194,7 @@ impl SubStats {
                 serde_json::json!({
                     "table": table,
                     "subs": s.active.max(0),
+                    "total": s.total,
                     "tx": s.tx_bytes,
                     "rx": s.rx_bytes,
                 })
@@ -288,25 +294,22 @@ impl WasmClient {
 
     /// Aim a viewport anchor at hex `(q, r)` on `(surface, owner)`, subscribing the
     /// surrounding zones. `radius_tiles` is the VISIBLE half-extent in TILES (the
-    /// `AnchorRadii` tiers are tile distances, not zone counts) — the `active`
-    /// tier covers exactly what's on screen so its zones stream. The `cold` tier
-    /// extends one [`PREFETCH_TILES`] ring further so the next zones' tiles
-    /// materialize BEFORE they scroll into view — without it a pan reveals a
-    /// blank row/col while the just-entered zone is still being requested.
-    /// `owner` is `0` for the world, or the soul card_id for an inventory
-    /// surface. Each `(surface, owner)` is a distinct named anchor so multiple
-    /// viewports don't clobber each other. Re-call on pan.
+    /// `AnchorRadii` tiers are tile distances, not zone counts). The `active` disk
+    /// is the visible region plus [`ANCHOR_MARGIN_TILES`], so the macro_zones
+    /// bordering the viewport are requested (Card + Zone subs) and stream as a pan
+    /// reaches them. No separate prefetch ring — `hot`/`warm`/`cold` are 0.
+    /// `owner` is `0` for the world, or the soul card_id for an inventory surface.
+    /// Each `(surface, owner)` is a distinct named anchor so multiple viewports
+    /// don't clobber each other. Re-call on pan.
     pub fn set_anchor(&mut self, surface: u8, owner: u32, q: i32, r: i32, radius_tiles: i32) {
-        let active = radius_tiles.max(1);
+        let active = radius_tiles.max(1) + ANCHOR_MARGIN_TILES;
         let frames = self.core.dispatch(Command::SetAnchor {
             name: format!("viewport:{surface}:{owner}"),
             surface,
             owner,
             q,
             r,
-            // active = visible (Card + Zone subs); cold = prefetch ring (Zone sub
-            // ⇒ tiles materialize ahead). hot/warm unused (0 ⇒ skipped).
-            radii: AnchorRadii { active, hot: 0, warm: 0, cold: active + PREFETCH_TILES },
+            radii: AnchorRadii { active, hot: 0, warm: 0, cold: 0 },
         });
         self.send(&frames);
     }
@@ -531,7 +534,11 @@ impl WasmClient {
         self.core.tick(now);
         let out = self.core.drain_outbound();
         self.send(&out);
-        std::mem::take(&mut self.changed)
+        // A zone that loaded ahead of the buffered clock promotes with no row
+        // event; fold that render kick in so the worker re-emits the view (else a
+        // stationary viewport stays blank until the next pan).
+        let kicked = self.core.take_render_kick();
+        std::mem::take(&mut self.changed) || kicked
     }
 
     /// The new content version if the gate hot-swapped its corpus since the last

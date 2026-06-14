@@ -324,6 +324,16 @@ pub struct Client {
     /// entries and re-marks their chain roots dirty — the promotion kick. See
     /// [[project_future_row_progress_kick]].
     pending_promotions: Vec<(u64, u32)>,
+    /// Earliest future zone `valid_at` time still pending promotion, or `None`.
+    /// A future-stamped zone row fires no event when the clock crosses its time,
+    /// so [`tick`](Self::tick) watches this and raises [`render_kick`] when due —
+    /// otherwise a stationary viewport never repaints zones that loaded ahead of
+    /// the buffered clock (the black-on-login wart). See
+    /// [[project_future_row_progress_kick]].
+    next_zone_promote: Option<u64>,
+    /// Set when a zone promoted this tick with no accompanying row event; the wasm
+    /// pump folds it into its `changed` flag so the worker re-emits the view.
+    render_kick: bool,
     /// In-flight movements, keyed by soul card_id. The client PIPELINES tile steps:
     /// it requests step N+1 the instant it receives step N's future-stamped row
     /// ([`advance_movement`](Self::advance_movement)), so the server has step N's
@@ -417,6 +427,8 @@ impl Default for Client {
             dirty_positions: HashSet::new(),
             local_seq: 0,
             pending_promotions: Vec::new(),
+            next_zone_promote: None,
+            render_kick: false,
             movements: HashMap::new(),
             zone_observers: HashMap::new(),
             chat_inbox: Vec::new(),
@@ -1839,6 +1851,16 @@ impl Client {
                 }
             }
         }
+        // Render-promotion kick: a zone stamped ahead of the buffered clock fires
+        // no event when the clock reaches it, so a stationary viewport wouldn't
+        // repaint. When the earliest pending promotion comes due, flag a re-render
+        // and recompute the next one from the store.
+        if let Some(t) = self.next_zone_promote {
+            if self.clock_ms >= t {
+                self.render_kick = true;
+                self.next_zone_promote = self.world.zones.min_future_time(self.clock_ms);
+            }
+        }
         // Budgeted re-identification: drain the dirty-root set at most ~1/s.
         if !self.dirty_roots.is_empty() && perf_ms - self.last_match_perf >= MATCH_BUDGET_MS {
             self.last_match_perf = perf_ms;
@@ -1851,6 +1873,13 @@ impl Client {
             self.last_magnet_perf = perf_ms;
             self.magnetic_pass();
         }
+    }
+
+    /// Take and clear the render-promotion kick — `true` if a zone promoted this
+    /// tick with no row event (so the host should re-emit the view). Drained by
+    /// the wasm pump into its `changed` flag.
+    pub fn take_render_kick(&mut self) -> bool {
+        std::mem::take(&mut self.render_kick)
     }
 
     /// One tick of the "magnetic player": drive every magnetic card we own. For
@@ -2372,6 +2401,13 @@ impl Client {
             "zones" => match serde_json::from_value::<crate::rows::ZoneRow>(row) {
                 Ok(zone) => {
                     let macro_zone = zone.macro_zone;
+                    // A row stamped ahead of the buffered clock promotes silently
+                    // later — track the earliest so `tick` can kick a re-render then.
+                    let t = zone.time_ms();
+                    if t > self.clock_ms {
+                        self.next_zone_promote =
+                            Some(self.next_zone_promote.map_or(t, |n| n.min(t)));
+                    }
                     self.world.zones.apply(op, zone);
                     // Completion is now the region's `available` bit (server truth),
                     // which the reconcile reads — the tile row just feeds the render

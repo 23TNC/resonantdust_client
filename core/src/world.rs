@@ -200,6 +200,20 @@ impl Zones {
         })
     }
 
+    /// The earliest `valid_at` time still in the FUTURE relative to `now_ms`
+    /// across all zones — when the next zone will promote into the current view.
+    /// `None` if every stored row is already current. A future-stamped zone row
+    /// fires NO event when the clock later crosses its time, so the core watches
+    /// this to know when to re-render (the stationary-load render kick).
+    pub fn min_future_time(&self, now_ms: u64) -> Option<u64> {
+        self.by_macro
+            .values()
+            .flat_map(|hist| hist.values())
+            .map(|z| z.time_ms())
+            .filter(|t| *t > now_ms)
+            .min()
+    }
+
     /// Anchor-aware GC, keyed by `macro_zone` (the zone IS its own key).
     pub fn gc(&mut self, now_ms: u64, mut pins_for_zone: impl FnMut(u64) -> Vec<u64>) {
         for (zone, hist) in self.by_macro.iter_mut() {
