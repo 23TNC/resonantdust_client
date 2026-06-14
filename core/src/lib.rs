@@ -12,6 +12,7 @@ pub mod clock;
 pub mod client;
 pub mod content;
 pub mod gate;
+pub mod outbox;
 pub mod rows;
 pub mod transport;
 pub mod world;

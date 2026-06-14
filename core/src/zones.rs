@@ -33,8 +33,8 @@
 use std::collections::{HashMap, HashSet};
 
 use resonantdust_codec::packed::{
-    owner_of, pack_macro_zone_full, region_of_zone, surface_of, unpack_macro_zone, world_tile,
-    zone_local, INVENTORY_LAYER, ZONE_SIZE,
+    owner_of, pack_macro_zone_full, region_of_zone, surface_of, unpack_macro_zone, zone_local,
+    INVENTORY_LAYER,
 };
 
 /// Subscription/memory tier for a tracked zone, in nested distance bands (active
@@ -73,10 +73,20 @@ pub enum ZoneIntent {
     /// A region must be subscribed / released (held while a `Zone` sub inside it
     /// is open).
     Region { region: u64, subscribed: bool },
-    /// A wanted world zone is present-but-not-yet-materialized; spawn it.
-    RequestZone { zone: u64 },
-    /// A wanted world zone has no governing `Region` yet; declare one.
-    EnsureRegion { zone: u64 },
+}
+
+/// What a wanted zone needs to materialize, per the region's server-truth bits.
+/// The driver reconciles these into idempotent `ensure_region` / `request_zone`
+/// calls through the `Outbox` — there is no client-side request dedup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneNeed {
+    /// No governing region yet — `ensure_region` (call keyed on the region).
+    Ensure,
+    /// Region known, zone spawnable (`presence`) but not yet `available` —
+    /// `request_zone`.
+    Request,
+    /// Materialized (`available`) or unspawnable (presence clear) — nothing to do.
+    Satisfied,
 }
 
 /// Per-tier tile radii an anchor projects (active ⊇ hot ⊇ warm ⊇ cold expected).
@@ -202,11 +212,11 @@ pub struct ZoneManager {
     subs: HashMap<(u64, DataType), SubState>,
 
     // ── region gate (Zone subs only) ──
+    // Server-truth cache: each subscribed region's presence/available bitmask.
+    // The driver's reconcile derives `ensure_region`/`request_zone` straight from
+    // these (via [`zone_needs`]) — no client-side request/arrival dedup latch.
     region_bits: HashMap<u64, RegionBits>,
     region_wanted: HashMap<u64, HashSet<u64>>,
-    requested: HashSet<u64>,
-    ensured_regions: HashSet<u64>,
-    arrived_zones: HashSet<u64>,
 
     anchors: HashMap<String, Anchor>,
 
@@ -236,12 +246,6 @@ struct RegionBits {
     distance: u16,
 }
 
-/// Cube/hex distance between axial tile coords. Mirrors `regions::hex_dist`.
-fn hex_dist(aq: i32, ar: i32, bq: i32, br: i32) -> i32 {
-    let dq = aq - bq;
-    let dr = ar - br;
-    (dq.abs() + dr.abs() + (dq + dr).abs()) / 2
-}
 
 impl Default for ZoneManager {
     fn default() -> Self {
@@ -251,9 +255,6 @@ impl Default for ZoneManager {
             subs: HashMap::new(),
             region_bits: HashMap::new(),
             region_wanted: HashMap::new(),
-            requested: HashSet::new(),
-            ensured_regions: HashSet::new(),
-            arrived_zones: HashSet::new(),
             anchors: HashMap::new(),
             soul_mem: HashMap::new(),
             max_open_subs: 512,
@@ -594,127 +595,62 @@ impl ZoneManager {
         if fresh {
             self.intents.push(ZoneIntent::Region { region, subscribed: true });
         }
-        self.maybe_request(zone);
+        // No request fired here — the driver's reconcile derives that from the
+        // region's bits once they arrive (or immediately, if already cached).
     }
 
     fn unwant_region(&mut self, zone: u64) {
         let (region, _bit) = region_of_zone(zone);
-        self.requested.remove(&zone);
         let Some(set) = self.region_wanted.get_mut(&region) else { return };
         set.remove(&zone);
         if set.is_empty() {
             self.region_wanted.remove(&region);
             self.region_bits.remove(&region);
-            self.ensured_regions.remove(&region);
             self.intents.push(ZoneIntent::Region { region, subscribed: false });
         }
     }
 
-    /// Fire `ensure_region` (region unknown) or `request_zone` (region known,
-    /// zone not yet materialized) at most once each.
-    fn maybe_request(&mut self, zone: u64) {
-        let (region, _bit) = region_of_zone(zone);
-        if !self.region_bits.contains_key(&region) {
-            if !self.ensured_regions.contains(&region) {
-                self.ensured_regions.insert(region);
-                self.intents.push(ZoneIntent::EnsureRegion { zone });
-            }
-            return;
-        }
-        if !self.arrived_zones.contains(&zone) && !self.requested.contains(&zone) {
-            self.requested.insert(zone);
-            self.intents.push(ZoneIntent::RequestZone { zone });
-        }
-    }
-
-    /// Feed the latest presence/availability bits for a subscribed region.
-    pub fn note_region(&mut self, region: u64, presence: u64, available: u64, distance: u16) {
-        self.region_bits.insert(region, RegionBits { presence, available, distance });
-        // A bounded container's disk may reach beyond this region into adjacent
-        // ones; ensure every region the disk touches so the whole inventory is
-        // declared (not just the region the viewport happens to anchor in).
-        self.ensure_disk_regions(region, distance);
-        let Some(set) = self.region_wanted.get(&region) else { return };
-        for zone in set.iter().copied().collect::<Vec<_>>() {
-            self.maybe_request(zone);
-        }
-    }
-
-    /// Ensure every region whose macro_zones hold a tile within `distance` of the
-    /// owner-origin tile `(0,0)` — so a container disk that spills past one region
-    /// declares the neighbours too. No-op for an unbounded (`u16::MAX`) region
-    /// (the world) and for a disk that fits in its home region (the common case).
-    fn ensure_disk_regions(&mut self, macro_region: u64, distance: u16) {
-        if distance == u16::MAX {
-            return;
-        }
-        let owner = owner_of(macro_region);
-        let surface = surface_of(macro_region);
-        let d = distance as i32;
-        let zb = (d / ZONE_SIZE + 1) as i16; // zones whose tiles can reach within `distance` of (0,0)
-        for zq in -zb..=zb {
-            for zr in -zb..=zb {
-                // Does zone (zq, zr) hold any in-disk tile?
-                let mut hit = false;
-                'cells: for lq in 0..ZONE_SIZE {
-                    for lr in 0..ZONE_SIZE {
-                        if hex_dist(world_tile(zq, lq as u8), world_tile(zr, lr as u8), 0, 0) <= d {
-                            hit = true;
-                            break 'cells;
+    /// What a wanted zone needs from the gate, derived ENTIRELY from server truth
+    /// (the region's `presence`/`available` bits) — no client-side "already did
+    /// it" latch. The driver's reconcile turns these into `Outbox` calls each
+    /// tick; a request that doesn't take leaves `available` clear, so it's simply
+    /// re-derived as `Request` again. Nothing can self-latch.
+    pub fn zone_needs(&self) -> Vec<(u64, ZoneNeed)> {
+        self.entries
+            .keys()
+            .map(|&zone| {
+                let (region, bit) = region_of_zone(zone);
+                let need = match self.region_bits.get(&region) {
+                    None => ZoneNeed::Ensure, // no governing region yet
+                    Some(b) => {
+                        let mask = 1u64 << bit;
+                        if b.available & mask != 0 {
+                            ZoneNeed::Satisfied // materialized server-side
+                        } else if b.presence & mask != 0 {
+                            ZoneNeed::Request // exists-able, not yet spawned
+                        } else {
+                            ZoneNeed::Satisfied // presence clear ⇒ can't spawn here
                         }
                     }
-                }
-                if !hit {
-                    continue;
-                }
-                let mz = pack_macro_zone_full(owner, surface, zq as i16, zr as i16);
-                let (r, _) = region_of_zone(mz);
-                if !self.region_bits.contains_key(&r) && self.ensured_regions.insert(r) {
-                    self.intents.push(ZoneIntent::EnsureRegion { zone: mz });
-                }
-            }
-        }
+                };
+                (zone, need)
+            })
+            .collect()
     }
 
-    #[allow(dead_code)]
+    /// Feed a subscribed region's current presence/availability bits. Server truth
+    /// — the reconcile reads it via [`zone_needs`] to decide what to (re)request;
+    /// nothing is fired here. The `regions` table is current-value (one row per
+    /// region updated in place), so this is a straight overwrite.
+    pub fn note_region(&mut self, region: u64, presence: u64, available: u64, distance: u16) {
+        self.region_bits.insert(region, RegionBits { presence, available, distance });
+    }
+
+    /// Drop a region from the cache (its row was deleted server-side). Rare — a
+    /// region is normally retired by the anchor leaving (`unwant_region`), not by
+    /// a server delete.
     pub fn note_region_removed(&mut self, region: u64) {
-        if self.region_bits.remove(&region).is_none() {
-            return;
-        }
-        let Some(set) = self.region_wanted.get(&region) else { return };
-        for zone in set.iter().copied().collect::<Vec<_>>() {
-            self.maybe_request(zone);
-        }
-    }
-
-    /// Mark a zone's tile row present — the request is fulfilled.
-    pub fn note_zone_arrived(&mut self, zone: u64) {
-        self.arrived_zones.insert(zone);
-        self.requested.remove(&zone);
-    }
-
-    /// Mark a zone's tile row gone; a still-wanted zone re-requests next reconcile.
-    pub fn note_zone_departed(&mut self, zone: u64) {
-        self.arrived_zones.remove(&zone);
-        self.requested.remove(&zone);
-    }
-
-    /// Re-arm a previously-rejected `ensure_region` / `request_zone` for `zone`:
-    /// clear its one-shot dedup (`ensured_regions` / `requested`) so
-    /// [`maybe_request`] re-emits the intent. The driver calls this after a gate
-    /// `time_drift` rejection, once it has re-seated the clock — without it the
-    /// dedup permanently suppresses the re-fire and the zone never materializes.
-    /// No-op if the zone is no longer wanted (the anchor moved off it before the
-    /// backed-off retry fired).
-    pub fn retry_request(&mut self, zone: u64) {
-        let (region, _bit) = region_of_zone(zone);
-        let wanted = self.region_wanted.get(&region).is_some_and(|s| s.contains(&zone));
-        if !wanted {
-            return;
-        }
-        self.ensured_regions.remove(&region);
-        self.requested.remove(&zone);
-        self.maybe_request(zone);
+        self.region_bits.remove(&region);
     }
 
     #[allow(dead_code)]
@@ -754,15 +690,18 @@ mod tests {
     #[test]
     fn centered_anchor_lights_one_active_zone() {
         let mut zm = ZoneManager::new();
-        zm.set_anchor("s", 12, 12, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
+        // Anchor on chunk 1's CENTRE tile (hex 7 = local cell 3 of chunk 1 under the
+        // TILE_CENTER=3 shift) so an active radius 2 stays inside the single chunk.
+        zm.set_anchor("s", 7, 7, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
         assert_eq!(zm.active_zones().collect::<Vec<_>>(), vec![world_zone(1, 1)]);
     }
 
     #[test]
     fn tiers_nest_and_split_sub_types() {
         let mut zm = ZoneManager::new();
-        zm.set_anchor("s", 12, 12, WORLD_LAYER, 0, soul_radii(), 0, 0);
-        // active 2 → chunk 1; hot 6 → chunks 0,2; warm 12 → 3; cold 20 → 4.
+        // Anchor on chunk 1's centre tile (hex 7) so the nested radii fall on whole
+        // chunks: active 2 → chunk 1; hot 6 → chunks 0,2; warm 12 → 3; cold 20 → 4.
+        zm.set_anchor("s", 7, 7, WORLD_LAYER, 0, soul_radii(), 0, 0);
         assert_eq!(zm.tier_of(world_zone(1, 1)), Some(ZoneTier::Active));
         assert_eq!(zm.tier_of(world_zone(0, 0)), Some(ZoneTier::Hot));
         assert_eq!(zm.tier_of(world_zone(3, 3)), Some(ZoneTier::Warm));
@@ -816,31 +755,39 @@ mod tests {
     fn capacity_lru_evicts_oldest_silent_candidate() {
         let mut zm = ZoneManager::new();
         zm.max_open_subs = 2; // tiny cap to force eviction
-        // Centered anchor (hex 12 = cell 4 of chunk 1) → exactly chunk (1,1) →
+        // Centred anchor (hex 7 = centre cell 3 of chunk 1) → exactly chunk (1,1) →
         // card+zone = 2 subs = cap.
-        zm.set_anchor("s", 12, 12, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
+        zm.set_anchor("s", 7, 7, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
         let z1 = world_zone(1, 1);
         assert!(zm.open_subs().any(|(zz, _)| zz == z1));
-        // Move to a far centered chunk (hex 204 = cell 4 of chunk 25) → exactly
+        // Move to a far centred chunk (hex 175 = centre cell 3 of chunk 25) → exactly
         // chunk (25,25). z1's 2 subs go silent-candidate; z2 wants 2 → over the
         // cap → LRU evicts z1's (older last_present).
-        zm.set_anchor("s", 204, 204, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 10);
+        zm.set_anchor("s", 175, 175, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 10);
         let z2 = world_zone(25, 25);
         assert!(zm.open_subs().any(|(zz, _)| zz == z2), "new zone subscribed");
         assert!(!zm.open_subs().any(|(zz, _)| zz == z1), "LRU evicted the older silent candidate");
     }
 
     #[test]
-    fn region_gate_requests_on_zone_sub() {
+    fn zone_needs_track_region_bits() {
+        fn need(zm: &ZoneManager, z: u64) -> Option<ZoneNeed> {
+            zm.zone_needs().into_iter().find(|(zz, _)| *zz == z).map(|(_, n)| n)
+        }
         let mut zm = ZoneManager::new();
-        zm.set_anchor("s", 12, 12, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
+        // Anchor on chunk 1's centre tile → covers exactly zone (1,1).
+        zm.set_anchor("s", 7, 7, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, 0, 0);
         let z = world_zone(1, 1);
-        let _ = zm.take_intents();
-        let (region, _) = region_of_zone(z);
-        zm.note_region(region, u64::MAX, u64::MAX, u16::MAX);
-        let intents = zm.take_intents();
-        assert!(intents.iter().any(|i| matches!(i, ZoneIntent::RequestZone { zone } if *zone == z)));
-        assert!(zm.is_zone_present(z));
+        let (region, bit) = region_of_zone(z);
+        let mask = 1u64 << bit;
+        // No governing region yet → Ensure.
+        assert_eq!(need(&zm, z), Some(ZoneNeed::Ensure));
+        // Region known, zone present but not available → Request.
+        zm.note_region(region, mask, 0, u16::MAX);
+        assert_eq!(need(&zm, z), Some(ZoneNeed::Request));
+        // `available` set → Satisfied (materialized; the reconcile won't re-request).
+        zm.note_region(region, mask, mask, u16::MAX);
+        assert_eq!(need(&zm, z), Some(ZoneNeed::Satisfied));
     }
 
     #[test]
@@ -864,9 +811,10 @@ mod tests {
         zm.max_memory_zones = 1;
         let soul = 7000u32;
         let z1 = world_zone(1, 1);
-        // Visit z1 then leave (frozen). Then visit a far zone, then leave.
-        zm.set_anchor("soul:7000", 12, 12, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, soul, 10);
-        zm.set_anchor("soul:7000", 204, 204, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, soul, 20);
+        // Visit z1 then leave (frozen). Then visit a far zone, then leave. Anchors on
+        // chunk-centre tiles (hex 7 → chunk 1, hex 175 → chunk 25) so each is one zone.
+        zm.set_anchor("soul:7000", 7, 7, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, soul, 10);
+        zm.set_anchor("soul:7000", 175, 175, WORLD_LAYER, 0, AnchorRadii { active: 2, ..Default::default() }, soul, 20);
         // Now memory has z1 (frozen@10) + z2 (present). cap 1 → z1 (frozen) forgotten.
         assert_eq!(zm.card_view_time(soul, z1, 99), None, "least-recently-present zone forgotten");
         assert_eq!(zm.card_view_time(soul, world_zone(25, 25), 99), Some(99), "current zone kept (present)");

@@ -16,10 +16,13 @@
 
 /// Default debounce window before a multi-input match commits.
 pub const DEFAULT_DELAY_MS: f64 = 5000.0;
-/// Cap on time-drift resubmits before dropping (anti clock-skew loop).
+/// Cap on time-drift resubmits before dropping (anti clock-skew loop). Applies to
+/// the *action* queue only — zone/region ensures retry unboundedly (see below),
+/// because a missing region is a permanent visible hole, not a droppable action.
 pub const MAX_TIME_DRIFT_RETRIES: u32 = 3;
 /// Padding over the reported gap when rescheduling a time-drift retry.
 pub const TIME_DRIFT_RETRY_PAD_MS: f64 = 250.0;
+
 
 /// One queued recipe, keyed by its chain root in the client's action queue.
 #[derive(Debug, Clone, PartialEq)]

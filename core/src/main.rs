@@ -11,6 +11,7 @@ mod clock;
 mod client;
 mod content;
 mod gate;
+mod outbox;
 mod rows;
 mod session;
 mod transport;

@@ -105,14 +105,14 @@ pub struct ZoneRow {
     #[serde(deserialize_with = "de_str_num")] t12: u64,
 }
 
-/// One version-row of the `regions` table — the per-region spawn
-/// presence/availability bitfields, as the gate delivers it (camelCase keys,
-/// stringified numbers). Feeds the zone manager's region gate.
-#[allow(dead_code)] // valid_at / available read as the gate refines (current-at-now)
+/// The `regions` table row — the per-region spawn presence/availability
+/// bitfields, as the gate delivers it (camelCase keys, stringified numbers).
+/// Current-value (one row per `macro_region`, no `valid_at`). Feeds the zone
+/// manager's region gate.
+#[allow(dead_code)] // available is carried for completeness; the gate reads presence/available
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegionRow {
-    #[serde(deserialize_with = "de_str_num")] pub valid_at: u64,
     #[serde(deserialize_with = "de_str_num")] pub macro_region: u64,
     /// Bit `i` set → the zone at region slot `i` MAY be spawned.
     #[serde(deserialize_with = "de_str_num")] pub zone_presence: u64,
@@ -121,12 +121,6 @@ pub struct RegionRow {
     /// Disk radius (tiles) the region is bounded by (presence + tile mask). The
     /// client only reads `zone_presence`; carried for completeness / future use.
     #[serde(deserialize_with = "de_str_num")] pub distance: u16,
-}
-
-impl RegionRow {
-    pub fn time_ms(&self) -> u64 {
-        valid_at_time(self.valid_at)
-    }
 }
 
 impl ZoneRow {

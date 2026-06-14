@@ -26,7 +26,9 @@ use resonantdust_state::recipe_state::CardStore;
 use resonantdust_state::stack::{self, plan_place, StackStore};
 use resonantdust_dsl::vm::match_recipe;
 
-use crate::actions::{QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, TIME_DRIFT_RETRY_PAD_MS};
+use crate::actions::{
+    QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, TIME_DRIFT_RETRY_PAD_MS,
+};
 use crate::clock::ClockSync;
 use crate::rows::CardRow;
 use crate::world::World;
@@ -260,17 +262,14 @@ pub struct Client {
     /// resolved `cid`: `(last, best, samples)`. Debug HUD only — RTT does not feed
     /// the clock estimate (that re-seats off `server_micros` / `time_drift`).
     rtt: (Option<f64>, Option<f64>, u32),
-    /// In-flight `ensure_region` / `request_zone` calls → their target `zone`, so
-    /// a `time_drift` rejection can re-arm exactly that materialization (the
-    /// `zones` dedup otherwise blocks any re-fire). Cleared on the call's reply.
-    zone_calls: HashMap<u32, u64>,
-    /// Per-zone `time_drift` retry counter for the above, bounded by
-    /// [`MAX_TIME_DRIFT_RETRIES`]; cleared on success or when exhausted.
-    zone_retry_attempt: HashMap<u64, u32>,
-    /// Backed-off zone re-requests: `(zone, ready_perf_ms)`. [`tick`](Self::tick)
-    /// drains those whose back-off has elapsed (clock re-seated by `note_drift`),
-    /// re-arming them in `zones` so [`zone_frames`](Self::zone_frames) re-emits.
-    zone_retries: Vec<(u64, f64)>,
+    /// The fault-tolerant outbound call queue. `ensure_region` / `request_zone`
+    /// flow through here, driven by the reconcile against the region's server-truth
+    /// bits — no client-side request latch. Replies route to `on_ok`/`on_err`/
+    /// `on_promise`; a silent failure simply re-fires. See [`crate::outbox`].
+    outbox: crate::outbox::Outbox,
+    /// Call hashes the zone reconcile currently wants — the diff against the next
+    /// reconcile retires (via `Outbox::done`) calls whose zone left coverage.
+    reconcile_hashes: std::collections::HashSet<u64>,
     /// Chain roots whose board state changed since the last match pass — the
     /// dirty set. Re-identification is **budgeted** ([`MATCH_BUDGET_MS`]): card
     /// rows mark their root dirty here and [`tick`](Self::tick) drains the set at
@@ -403,9 +402,8 @@ impl Default for Client {
             souls: HashMap::new(),
             inflight_calls: HashMap::new(),
             rtt: (None, None, 0),
-            zone_calls: HashMap::new(),
-            zone_retry_attempt: HashMap::new(),
-            zone_retries: Vec::new(),
+            outbox: crate::outbox::Outbox::new(),
+            reconcile_hashes: std::collections::HashSet::new(),
             dirty_roots: HashSet::new(),
             last_match_perf: 0.0,
             magnet_deadlines: HashMap::new(),
@@ -555,6 +553,27 @@ impl Client {
     pub fn drain_outbound(&mut self) -> Vec<ClientMsg> {
         let mut out = std::mem::take(&mut self.pending_out);
         out.extend(self.zone_frames());
+        // Pump the fault-tolerant call queue: due, not-in-flight requests become
+        // `Call` frames with a fresh cid + a freshly-stamped `client_time_ms`
+        // (the queue stores stable args; the timestamp is per-attempt). Record the
+        // send instant for RTT / `time_drift` re-seat, same as a direct call.
+        let now = self.perf_ms;
+        let clock = self.clock_ms;
+        let mut next = self.next_cid;
+        let outgoing = self.outbox.pump(now, || {
+            let c = next;
+            next += 1;
+            c
+        });
+        self.next_cid = next;
+        for o in outgoing {
+            self.inflight_calls.insert(o.cid, (self.perf_ms, clock));
+            let mut args = o.args;
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("client_time_ms".to_string(), serde_json::json!(clock));
+            }
+            out.push(ClientMsg::Call { cid: o.cid, reducer: o.reducer, args });
+        }
         out
     }
 
@@ -725,33 +744,43 @@ impl Client {
                         out.push(ClientMsg::Unsub { sid });
                     }
                 }
-                ZoneIntent::RequestZone { zone } => {
-                    let cid = self.cid();
-                    self.zone_calls.insert(cid, zone);
-                    out.push(ClientMsg::Call {
-                        cid,
-                        reducer: "request_zone".to_string(),
-                        args: serde_json::json!({
-                            "client_time_ms": self.clock_ms,
-                            "macro_zone": zone,
-                        }),
-                    });
-                }
-                ZoneIntent::EnsureRegion { zone } => {
-                    let cid = self.cid();
-                    self.zone_calls.insert(cid, zone);
-                    out.push(ClientMsg::Call {
-                        cid,
-                        reducer: "ensure_region".to_string(),
-                        args: serde_json::json!({
-                            "client_time_ms": self.clock_ms,
-                            "macro_zone": zone,
-                        }),
-                    });
-                }
             }
         }
         out
+    }
+
+    /// Reconcile the zone-materialization Outbox against server truth: for every
+    /// wanted zone, `want` the `ensure_region`/`request_zone` it needs (idempotent,
+    /// keyed by content hash) and `done` anything a satisfied/departed zone no
+    /// longer needs. Run each [`tick`](Self::tick); the actual sends are paced by
+    /// [`Outbox::pump`] in [`drain_outbound`](Self::drain_outbound).
+    fn reconcile_zones(&mut self) {
+        use crate::outbox::call_hash;
+        use resonantdust_codec::packed::region_of_zone;
+        let now = self.perf_ms;
+        let mut want: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (zone, need) in self.zones.zone_needs() {
+            match need {
+                crate::zones::ZoneNeed::Ensure => {
+                    let (region, _) = region_of_zone(zone);
+                    let h = call_hash("ensure_region", region);
+                    if want.insert(h) {
+                        self.outbox.want(h, "ensure_region", serde_json::json!({ "macro_zone": zone }), now);
+                    }
+                }
+                crate::zones::ZoneNeed::Request => {
+                    let h = call_hash("request_zone", zone);
+                    want.insert(h);
+                    self.outbox.want(h, "request_zone", serde_json::json!({ "macro_zone": zone }), now);
+                }
+                crate::zones::ZoneNeed::Satisfied => {}
+            }
+        }
+        // Retire calls for zones that left coverage / became satisfied.
+        for h in self.reconcile_hashes.difference(&want).copied().collect::<Vec<_>>() {
+            self.outbox.done(h);
+        }
+        self.reconcile_hashes = want;
     }
 
     /// One step of the player → player_soul → soul → cards discovery walk, run
@@ -1709,10 +1738,9 @@ impl Client {
             GateMsg::CallOk { cid, server_micros } => {
                 let mut out = self.sample_clock(&server_micros);
                 self.resolve_action(cid, None);
-                // The region/zone materialized server-side — clear its retry state.
-                if let Some(zone) = self.zone_calls.remove(&cid) {
-                    self.zone_retry_attempt.remove(&zone);
-                }
+                // Outbox calls: the goal is reached → retire (no-op for non-Outbox
+                // cids, e.g. a propose handled by `resolve_action` above).
+                self.outbox.on_ok(cid);
                 self.record_rtt(cid);
                 self.inflight_calls.remove(&cid);
                 out.push(Event::CallOk { cid });
@@ -1724,16 +1752,22 @@ impl Client {
                 self.note_drift(cid, &error);
                 let mut out = self.sample_clock(&server_micros);
                 self.resolve_action(cid, Some(&error));
-                // A rejected `ensure_region`/`request_zone` is fire-and-forget with
-                // a dedup that blocks re-fire, so it would never recover on its own.
-                // Re-calc (note_drift above) + back off + re-request — the fix for
-                // neighbour regions never materializing under clock skew (alpha).
-                if let Some(zone) = self.zone_calls.remove(&cid) {
-                    self.schedule_zone_retry(zone, &error);
-                }
+                // Outbox calls: re-queue with exponential back-off (no latch).
+                self.outbox.on_err(cid, self.perf_ms);
                 self.record_rtt(cid);
                 self.inflight_calls.remove(&cid);
                 out.push(Event::CallErr { cid, error });
+                out
+            }
+            GateMsg::CallPromise { cid, timeout_ms, server_micros } => {
+                // ACCEPTED for async resolution: hold the call in the Outbox's
+                // `Awaiting` state until the gate resolves it (a later CallOk/CallErr
+                // on this cid) or `timeout_ms` elapses → retry. A promise is still a
+                // round-trip → a clock sample + an RTT slot to free.
+                let out = self.sample_clock(&server_micros);
+                self.outbox.on_promise(cid, timeout_ms as f64, self.perf_ms);
+                self.record_rtt(cid);
+                self.inflight_calls.remove(&cid);
                 out
             }
             GateMsg::Row { table, op, row, .. } => self.apply_row(&table, op, row),
@@ -1780,23 +1814,11 @@ impl Client {
         if self.clock.is_synced() {
             self.clock_ms = self.clock.server_now_ms(perf_ms).max(0.0) as u64;
         }
-        // Re-arm backed-off zone/region materializations whose drift window has
-        // passed (clock since re-seated). `retry_request` clears the `zones` dedup
-        // so `zone_frames` (drained later this pump) re-emits the call.
-        if !self.zone_retries.is_empty() {
-            let mut due: Vec<u64> = Vec::new();
-            self.zone_retries.retain(|(zone, ready)| {
-                if perf_ms >= *ready {
-                    due.push(*zone);
-                    false
-                } else {
-                    true
-                }
-            });
-            for zone in due {
-                self.zones.retry_request(zone);
-            }
-        }
+        // Reconcile the zone-materialization Outbox against the regions' server
+        // truth — `want` what's needed, `done` what's satisfied/departed. The
+        // Outbox's own back-off + the `available` bit handle retry & completion;
+        // there is no client-side retry queue.
+        self.reconcile_zones();
         // Promotion kick: future rows that have come due re-mark their chain root
         // dirty (no Insert fires on promotion, so the matcher would otherwise never
         // re-evaluate a recipe-created/changed card). See `pending_promotions`.
@@ -2172,32 +2194,6 @@ impl Client {
         }
     }
 
-    /// A rejected `ensure_region`/`request_zone` reply: on a `time_drift` reject,
-    /// back off past the drift gap and re-arm the zone (bounded by
-    /// [`MAX_TIME_DRIFT_RETRIES`]); `tick` re-fires it once the back-off elapses,
-    /// with the clock already re-seated by `note_drift`. Non-drift errors drop it
-    /// (mirrors the action path — a non-clock reject won't fix itself by resending).
-    fn schedule_zone_retry(&mut self, zone: u64, error: &str) {
-        if !error.contains("time_drift") {
-            self.zone_retry_attempt.remove(&zone);
-            return;
-        }
-        let n = self.zone_retry_attempt.entry(zone).or_insert(0);
-        if *n >= MAX_TIME_DRIFT_RETRIES {
-            self.zone_retry_attempt.remove(&zone);
-            return;
-        }
-        *n += 1;
-        // Wait out the named drift gap (+ pad), same shape as the action retry.
-        let gap = error
-            .split("client_ahead_by=")
-            .nth(1)
-            .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
-            .and_then(|s| s.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        self.zone_retries.push((zone, self.perf_ms + gap + TIME_DRIFT_RETRY_PAD_MS));
-    }
-
     /// Drain the final outcomes of fired queued actions: `(recipe, Err(reason)?)`.
     /// A driver/harness uses this to distinguish a real accept (`None`) from a
     /// silent drop on rejection (`Some(reason)`) — the queue empties on both.
@@ -2377,13 +2373,9 @@ impl Client {
                 Ok(zone) => {
                     let macro_zone = zone.macro_zone;
                     self.world.zones.apply(op, zone);
-                    // The row's arrival is the authoritative "zone materialized"
-                    // signal for the region gate (clears any pending request).
-                    match op {
-                        RowOp::Insert | RowOp::Update => self.zones.note_zone_arrived(macro_zone),
-                        RowOp::Delete => self.zones.note_zone_departed(macro_zone),
-                    }
-                    // Warmth: a zone-tile update feeds the Zone-sub candidate counter.
+                    // Completion is now the region's `available` bit (server truth),
+                    // which the reconcile reads — the tile row just feeds the render
+                    // + the Zone-sub warmth counter; no request bookkeeping here.
                     self.zones.note_update(macro_zone, DataType::Zone, self.clock_ms);
                     vec![Event::ZoneUpserted { macro_zone }]
                 }
@@ -2391,9 +2383,9 @@ impl Client {
             },
             "regions" => match serde_json::from_value::<crate::rows::RegionRow>(row) {
                 Ok(region) => {
-                    // Feed the region gate. Insert/Update → latest presence bits
-                    // (newly-present zones reconcile into live subs / requests);
-                    // Delete → forget the region.
+                    // Feed the region gate. `regions` is current-value (one row per
+                    // macro_region, updated in place), so Insert/Update overwrite the
+                    // cached bits and a genuine Delete drops them.
                     match op {
                         RowOp::Insert | RowOp::Update => self.zones.note_region(
                             region.macro_region,
@@ -3001,10 +2993,13 @@ mod tests {
             op,
             old: None,
             row: serde_json::json!({
-                "validAt": pack_valid_at(100, 1).to_string(),
                 "macroRegion": macro_region.to_string(),
                 "zonePresence": presence.to_string(),
                 "zoneAvailable": available.to_string(),
+                // `Region` gained a disk `distance` (u16, str-encoded like the rest);
+                // world rows carry u16::MAX (full disk). The request count keys on the
+                // passed-in presence, so the exact value is immaterial here.
+                "distance": u16::MAX.to_string(),
             }),
         }
     }
@@ -3034,11 +3029,14 @@ mod tests {
         // 9 active zones, each Full = zones + cards scoped to its macro_zone.
         assert_eq!(count_sub(&frames, "zones"), 9, "one scoped zones sub per active zone");
         assert_eq!(count_sub(&frames, "cards"), 9, "one scoped cards sub per active zone");
-        // All 9 share one region → one region sub + one ensure_region (region unknown).
+        // All 9 share one region → one region sub.
         assert_eq!(count_sub(&frames, "regions"), 1);
-        assert_eq!(count_call(&frames, "ensure_region"), 1);
-        // No request_zone yet — the region isn't mirrored.
-        assert_eq!(count_call(&frames, "request_zone"), 0);
+        // Materialization flows through the reconcile + Outbox (tick → drain), not
+        // the sub frames: region unknown → one ensure_region, no request yet.
+        c.tick(0.0);
+        let calls = c.drain_outbound();
+        assert_eq!(count_call(&calls, "ensure_region"), 1, "one ensure for the shared region");
+        assert_eq!(count_call(&calls, "request_zone"), 0, "no request until the region is known");
         // The scoped filters are macro_zone equality.
         assert!(frames.iter().any(|f| matches!(f,
             ClientMsg::Sub { table, filter: Some(fl), .. }
@@ -3055,113 +3053,25 @@ mod tests {
             owner: 0,
             q: 16,
             r: 16,
-            // active radius 8 from the chunk-(2,2) corner spans chunks 1..=3 each
-            // axis → the same 9 zones in region 0 the old 3×3 ring produced.
+            // active radius 8 ≈ 9 zones in region 0.
             radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
         });
         let (region, _) = region_of_zone(pack_macro_zone_full(0, WORLD_LAYER, 2, 2));
-
-        // The region declares all its zones present. apply() folds it (no event);
-        // the follow-up frames carry the spawn requests.
-        assert_eq!(c.apply(region_row_frame(RowOp::Insert, region, u64::MAX, 0)), vec![]);
-        let frames = c.zone_frames();
-        assert_eq!(count_call(&frames, "request_zone"), 9, "each active zone requested once");
-
-        // A second identical region update does not re-request (requested set).
-        c.apply(region_row_frame(RowOp::Update, region, u64::MAX, 0));
-        assert_eq!(count_call(&c.zone_frames(), "request_zone"), 0, "no duplicate requests");
+        // Region declares all zones present, none available yet.
+        c.apply(region_row_frame(RowOp::Insert, region, u64::MAX, 0));
+        // The reconcile (in tick) → the Outbox (in drain_outbound) carry the requests.
+        c.tick(0.0);
+        assert_eq!(count_call(&c.drain_outbound(), "request_zone"), 9, "each active zone requested once");
+        // Still in flight (no reply) → no duplicate sends.
+        c.tick(0.0);
+        assert_eq!(count_call(&c.drain_outbound(), "request_zone"), 0, "no duplicate while in flight");
     }
 
     #[test]
-    fn time_drift_rejected_ensure_region_retries_after_backoff() {
-        use resonantdust_codec::packed::WORLD_LAYER;
-        let mut c = Client::new();
-        // Anchor → fires one ensure_region for the (still-unknown) region.
-        let frames = c.dispatch(Command::SetAnchor {
-            name: "soul".to_string(),
-            surface: WORLD_LAYER,
-            owner: 0,
-            q: 16,
-            r: 16,
-            radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
-        });
-        assert_eq!(count_call(&frames, "ensure_region"), 1);
-        let cid = frames
-            .iter()
-            .find_map(|f| match f {
-                ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
-                _ => None,
-            })
-            .expect("ensure_region cid");
-
-        // The gate rejects it as client-ahead (clock skew). Before the fix the
-        // dedup would suppress any re-fire and the region would never materialize.
-        let _ = c.apply(GateMsg::CallErr {
-            cid,
-            error: "time_drift:client_ahead_by=500 (server=1, client=501)".to_string(),
-            server_micros: String::new(),
-        });
-        // No immediate re-fire — it's backed off (gap 500 + pad 250 = 750ms).
-        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "no immediate re-fire");
-        c.tick(400.0);
-        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "held during backoff");
-        // Past the backoff: re-armed and re-emitted exactly once.
-        c.tick(800.0);
-        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 1, "re-requested after backoff");
-    }
-
-    #[test]
-    fn time_drift_retry_is_bounded() {
-        use resonantdust_codec::packed::WORLD_LAYER;
-        let mut c = Client::new();
-        let frames = c.dispatch(Command::SetAnchor {
-            name: "soul".to_string(),
-            surface: WORLD_LAYER,
-            owner: 0,
-            q: 16,
-            r: 16,
-            radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
-        });
-        // Reject, re-arm, re-fire — MAX_TIME_DRIFT_RETRIES times, then give up.
-        let mut perf = 0.0;
-        let mut cid = frames
-            .iter()
-            .find_map(|f| match f {
-                ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
-                _ => None,
-            })
-            .unwrap();
-        for _ in 0..MAX_TIME_DRIFT_RETRIES {
-            c.apply(GateMsg::CallErr {
-                cid,
-                error: "time_drift:client_ahead_by=100".to_string(),
-                server_micros: String::new(),
-            });
-            perf += 1000.0;
-            c.tick(perf);
-            let frames = c.zone_frames();
-            assert_eq!(count_call(&frames, "ensure_region"), 1, "re-fires within the retry budget");
-            cid = frames
-                .iter()
-                .find_map(|f| match f {
-                    ClientMsg::Call { cid, reducer, .. } if reducer == "ensure_region" => Some(*cid),
-                    _ => None,
-                })
-                .unwrap();
-        }
-        // Budget exhausted: the next rejection drops it (no further re-fire).
-        c.apply(GateMsg::CallErr {
-            cid,
-            error: "time_drift:client_ahead_by=100".to_string(),
-            server_micros: String::new(),
-        });
-        perf += 1000.0;
-        c.tick(perf);
-        assert_eq!(count_call(&c.zone_frames(), "ensure_region"), 0, "stops after the budget");
-    }
-
-    #[test]
-    fn zone_arrival_clears_the_pending_request() {
+    fn lying_call_ok_does_not_latch_and_self_heals() {
+        // The bug this whole machinery fixes: a `request_zone` that returns
+        // `call_ok` WITHOUT materializing the zone (the gate's premature ok) must
+        // NOT latch — the reconcile re-fires it because `available` stays clear.
         use resonantdust_codec::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
         let mut c = Client::new();
         c.dispatch(Command::SetAnchor {
@@ -3170,44 +3080,50 @@ mod tests {
             owner: 0,
             q: 16,
             r: 16,
-            // active radius 8 from the chunk-(2,2) corner spans chunks 1..=3 each
-            // axis → the same 9 zones in region 0 the old 3×3 ring produced.
             radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
         });
-        let target = pack_macro_zone_full(0, WORLD_LAYER, 2, 2);
-        let (region, _) = region_of_zone(target);
-        c.apply(region_row_frame(RowOp::Insert, region, u64::MAX, 0));
-        let _ = c.zone_frames(); // drains the 9 requests
+        let (region, _) = region_of_zone(pack_macro_zone_full(0, WORLD_LAYER, 2, 2));
+        c.apply(region_row_frame(RowOp::Insert, region, u64::MAX, 0)); // present, none available
+        c.tick(0.0);
+        let first = c.drain_outbound();
+        assert!(count_call(&first, "request_zone") > 0, "requests fire while unavailable");
+        // Every request comes back `call_ok` — but the region's `available` bits are
+        // STILL clear (the lie). The old latch would mark them done forever.
+        for f in &first {
+            if let ClientMsg::Call { cid, reducer, .. } = f {
+                if reducer == "request_zone" {
+                    c.apply(GateMsg::CallOk { cid: *cid, server_micros: String::new() });
+                }
+            }
+        }
+        // No availability update arrived → the reconcile re-derives `Request` and
+        // re-fires. Self-healing; nothing stranded.
+        c.tick(0.0);
+        assert!(count_call(&c.drain_outbound(), "request_zone") > 0, "lying call_ok re-fires — never latched");
+    }
 
-        // The target zone's row lands → note_zone_arrived. A later region update
-        // must not re-request it (already arrived), even though `requested` was
-        // cleared on arrival.
-        let zrow = GateMsg::Row {
-            sid: 0,
-            table: "zones".to_string(),
-            op: RowOp::Insert,
-            old: None,
-            row: serde_json::json!({
-                "validAt": pack_valid_at(100, 1).to_string(),
-                "zoneId": "1",
-                "macroZone": target.to_string(),
-                "packedDefinition": "0",
-                "ownerId": "0",
-                "t0": "0", "t1": "0", "t2": "0", "t3": "0", "t4": "0", "t5": "0",
-                "t6": "0", "t7": "0", "t8": "0", "t9": "0", "t10": "0", "t11": "0",
-                "t12": "0", "t13": "0", "t14": "0", "t15": "0",
-            }),
-        };
-        assert_eq!(c.apply(zrow), vec![Event::ZoneUpserted { macro_zone: target }]);
-        let _ = c.zone_frames();
+    #[test]
+    fn available_bit_retires_the_request() {
+        // The flip side: once the region reports a zone `available`, the reconcile
+        // retires its request — no re-firing on a materialized zone.
+        use resonantdust_codec::packed::{pack_macro_zone_full, region_of_zone, WORLD_LAYER};
+        let mut c = Client::new();
+        c.dispatch(Command::SetAnchor {
+            name: "soul".to_string(),
+            surface: WORLD_LAYER,
+            owner: 0,
+            q: 16,
+            r: 16,
+            radii: crate::zones::AnchorRadii { active: 8, hot: 0, warm: 0, cold: 0 },
+        });
+        let (region, _) = region_of_zone(pack_macro_zone_full(0, WORLD_LAYER, 2, 2));
+        c.apply(region_row_frame(RowOp::Insert, region, u64::MAX, 0));
+        c.tick(0.0);
+        assert!(count_call(&c.drain_outbound(), "request_zone") > 0);
+        // All available now (server truth) → retire; never re-request.
         c.apply(region_row_frame(RowOp::Update, region, u64::MAX, u64::MAX));
-        let frames = c.zone_frames();
-        assert!(
-            !frames.iter().any(|f| matches!(f,
-                ClientMsg::Call { reducer, args, .. }
-                    if reducer == "request_zone" && args["macro_zone"] == target)),
-            "an arrived zone is not re-requested"
-        );
+        c.tick(5_000.0);
+        assert_eq!(count_call(&c.drain_outbound(), "request_zone"), 0, "available ⇒ no re-request");
     }
 
     /// A `cards` Row frame in wire shape with a specific owner / macro_zone /

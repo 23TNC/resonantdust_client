@@ -9,7 +9,7 @@
 //! lives in JS.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
@@ -33,6 +33,171 @@ use resonantdust_client_core::zones::AnchorRadii;
 /// at normal pan speeds.
 const PREFETCH_TILES: i32 = 2 * ZONE_SIZE;
 
+/// One reducer's running tally for the debug HUD's "calls" tab.
+#[derive(Default)]
+struct CmdStat {
+    /// Outgoing `Call` frames sent (a fresh send each time — so an outbox retry
+    /// counts as another request).
+    requests: u32,
+    ok: u32,
+    err: u32,
+    promise: u32,
+    /// Serialized JSON byte size of the request/reply frames. An ESTIMATE of
+    /// wire bytes: it ignores WebSocket framing + any transport compression.
+    tx_bytes: u64,
+    rx_bytes: u64,
+}
+
+/// Per-reducer call accounting for the debug HUD. Every outgoing `Call` is
+/// tallied by reducer name in [`note_send`](CallStats::note_send); the matching
+/// `CallOk`/`CallErr`/`CallPromise` reply (which carries only the cid) is
+/// attributed back via the `cid → reducer` map in
+/// [`note_reply`](CallStats::note_reply). A promised call is resolved later by a
+/// terminal reply on the SAME cid, so its mapping is kept on `CallPromise` and
+/// dropped only on the terminal `CallOk`/`CallErr`.
+#[derive(Default)]
+struct CallStats {
+    by_reducer: BTreeMap<String, CmdStat>,
+    cid_reducer: HashMap<u32, String>,
+}
+
+impl CallStats {
+    fn note_send(&mut self, cid: u32, reducer: &str, bytes: usize) {
+        let e = self.by_reducer.entry(reducer.to_string()).or_default();
+        e.requests += 1;
+        e.tx_bytes += bytes as u64;
+        self.cid_reducer.insert(cid, reducer.to_string());
+    }
+
+    /// Tally an inbound frame IF it's a call reply; rows/time/etc. aren't
+    /// per-command and are ignored.
+    fn note_reply(&mut self, msg: &GateMsg, bytes: usize) {
+        let (cid, terminal) = match msg {
+            GateMsg::CallOk { cid, .. } => (*cid, true),
+            GateMsg::CallErr { cid, .. } => (*cid, true),
+            GateMsg::CallPromise { cid, .. } => (*cid, false),
+            _ => return,
+        };
+        // Terminal reply consumes the mapping; a promise keeps it (its ok/err
+        // lands later on the same cid).
+        let reducer = if terminal {
+            self.cid_reducer.remove(&cid)
+        } else {
+            self.cid_reducer.get(&cid).cloned()
+        };
+        let Some(reducer) = reducer else { return };
+        let e = self.by_reducer.entry(reducer).or_default();
+        e.rx_bytes += bytes as u64;
+        match msg {
+            GateMsg::CallOk { .. } => e.ok += 1,
+            GateMsg::CallErr { .. } => e.err += 1,
+            GateMsg::CallPromise { .. } => e.promise += 1,
+            _ => {}
+        }
+    }
+
+    /// The tally as a JSON array (one object per reducer, sorted by name), the
+    /// shape the worker forwards to the debug panel.
+    fn to_json(&self) -> String {
+        let arr: Vec<serde_json::Value> = self
+            .by_reducer
+            .iter()
+            .map(|(name, s)| {
+                serde_json::json!({
+                    "command": name,
+                    "requests": s.requests,
+                    "ok": s.ok,
+                    "err": s.err,
+                    "promise": s.promise,
+                    "tx": s.tx_bytes,
+                    "rx": s.rx_bytes,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
+/// One table's running subscription tally for the debug HUD's "subs" tab.
+#[derive(Default)]
+struct TableStat {
+    /// Currently-open subscriptions on this table (`Sub` − `Unsub`). Zone/card
+    /// subs are one-per-zone, so this climbs with the anchor's coverage.
+    active: i32,
+    /// Serialized JSON byte size of `Sub`/`Unsub` frames sent (tx) and the
+    /// `Row`/`Applied` frames received (rx). ESTIMATES — they ignore WebSocket
+    /// framing + any transport compression.
+    tx_bytes: u64,
+    rx_bytes: u64,
+}
+
+/// Per-table subscription accounting for the debug HUD. Outgoing `Sub`/`Unsub`
+/// frames adjust the table's `active` count + tx in [`note_send`](SubStats::note_send);
+/// inbound `Row` frames (which carry the table) and `Applied` acks (cid→table
+/// via the sid map) add rx in [`note_inbound`](SubStats::note_inbound). `Unsub`
+/// and `Applied` carry only a sid, so a `sid → table` map attributes them back.
+#[derive(Default)]
+struct SubStats {
+    by_table: BTreeMap<String, TableStat>,
+    sid_table: HashMap<u32, String>,
+}
+
+impl SubStats {
+    fn note_send(&mut self, frame: &ClientMsg, bytes: usize) {
+        match frame {
+            ClientMsg::Sub { sid, table, .. } => {
+                let e = self.by_table.entry(table.clone()).or_default();
+                e.active += 1;
+                e.tx_bytes += bytes as u64;
+                self.sid_table.insert(*sid, table.clone());
+            }
+            ClientMsg::Unsub { sid } => {
+                // Attribute the teardown's tx to the table the sid subscribed.
+                if let Some(table) = self.sid_table.remove(sid) {
+                    let e = self.by_table.entry(table).or_default();
+                    e.active -= 1;
+                    e.tx_bytes += bytes as u64;
+                }
+            }
+            ClientMsg::Call { .. } => {}
+        }
+    }
+
+    /// Tally an inbound frame IF it streams subscription data (`Row`) or acks a
+    /// subscription (`Applied`); call replies + others are ignored here.
+    fn note_inbound(&mut self, msg: &GateMsg, bytes: usize) {
+        match msg {
+            GateMsg::Row { table, .. } => {
+                self.by_table.entry(table.clone()).or_default().rx_bytes += bytes as u64;
+            }
+            GateMsg::Applied { sid } => {
+                if let Some(table) = self.sid_table.get(sid) {
+                    self.by_table.entry(table.clone()).or_default().rx_bytes += bytes as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The tally as a JSON array (one object per table, sorted by name), the
+    /// shape the worker forwards to the debug panel.
+    fn to_json(&self) -> String {
+        let arr: Vec<serde_json::Value> = self
+            .by_table
+            .iter()
+            .map(|(table, s)| {
+                serde_json::json!({
+                    "table": table,
+                    "subs": s.active.max(0),
+                    "tx": s.tx_bytes,
+                    "rx": s.rx_bytes,
+                })
+            })
+            .collect();
+        serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_string())
+    }
+}
+
 #[wasm_bindgen]
 pub struct WasmClient {
     core: Client,
@@ -50,6 +215,10 @@ pub struct WasmClient {
     /// The new content version if the gate broadcast a `content_changed` since
     /// the last drain — the worker reloads the bundle + tells the main thread.
     content_changed: Option<String>,
+    /// Per-reducer call tally for the debug HUD's "calls" tab.
+    stats: CallStats,
+    /// Per-table subscription tally for the debug HUD's "subs" tab.
+    subs: SubStats,
 }
 
 #[wasm_bindgen]
@@ -65,6 +234,8 @@ impl WasmClient {
             _onopen: None,
             changed: false,
             content_changed: None,
+            stats: CallStats::default(),
+            subs: SubStats::default(),
         }
     }
 
@@ -339,6 +510,11 @@ impl WasmClient {
         let frames: Vec<String> = self.incoming.borrow_mut().drain(..).collect();
         for raw in frames {
             if let Ok(msg) = serde_json::from_str::<GateMsg>(&raw) {
+                // Tally call replies (by cid → reducer) + subscription data (by
+                // table) before `apply` consumes the frame; `raw.len()` is the
+                // rx-bytes estimate.
+                self.stats.note_reply(&msg, raw.len());
+                self.subs.note_inbound(&msg, raw.len());
                 for ev in self.core.apply(msg) {
                     match ev {
                         Event::CardUpserted { .. }
@@ -371,6 +547,23 @@ impl WasmClient {
     /// adds the `Date.now()`-relative fields itself. Cheap — call each pump.
     pub fn clock_stats(&self) -> String {
         serde_json::to_string(&self.core.clock_stats()).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Per-reducer gateway-call tally as a JSON array (the debug HUD's "calls"
+    /// tab): `[{ command, requests, ok, err, promise, tx, rx }]`, sorted by
+    /// command name. `tx`/`rx` are serialized-frame byte ESTIMATES. Cheap —
+    /// drained each pump.
+    pub fn call_stats(&self) -> String {
+        self.stats.to_json()
+    }
+
+    /// Per-table subscription tally as a JSON array (the debug HUD's "subs"
+    /// tab): `[{ table, subs, tx, rx }]`, sorted by table name. `subs` is the
+    /// currently-open count; `tx`/`rx` are serialized-frame byte ESTIMATES (tx =
+    /// `Sub`/`Unsub` frames, rx = the `Row`/`Applied` frames they stream back).
+    /// Cheap — drained each pump.
+    pub fn sub_stats(&self) -> String {
+        self.subs.to_json()
     }
 
     /// The renderables in a region of `surface` centred on hex `(center_q,
@@ -477,10 +670,21 @@ impl WasmClient {
 
 impl WasmClient {
     /// Serialize + send each frame on the WebSocket (no-op before `connect`).
-    fn send(&self, frames: &[ClientMsg]) {
+    /// Tallies every outgoing frame: `Call`s into [`CallStats`] (request count +
+    /// tx estimate + cid→reducer), `Sub`/`Unsub` into [`SubStats`] (active count
+    /// + tx estimate + sid→table).
+    fn send(&mut self, frames: &[ClientMsg]) {
         if let Some(ws) = &self.ws {
             for m in frames {
                 if let Ok(s) = serde_json::to_string(m) {
+                    match m {
+                        ClientMsg::Call { cid, reducer, .. } => {
+                            self.stats.note_send(*cid, reducer, s.len());
+                        }
+                        ClientMsg::Sub { .. } | ClientMsg::Unsub { .. } => {
+                            self.subs.note_send(m, s.len());
+                        }
+                    }
                     let _ = ws.send_with_str(&s);
                 }
             }
