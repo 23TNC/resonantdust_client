@@ -1740,11 +1740,11 @@ impl Client {
 
     fn apply_inner(&mut self, msg: GateMsg) -> Vec<Event> {
         match msg {
-            GateMsg::Time { server_micros } => self.sample_clock(&server_micros),
+            GateMsg::Time { server_micros } => self.sample_clock(server_micros),
             GateMsg::Applied { sid } => vec![Event::Applied { sid }],
             GateMsg::Error { error } => vec![Event::Error { error }],
             GateMsg::CallOk { cid, server_micros } => {
-                let mut out = self.sample_clock(&server_micros);
+                let mut out = self.sample_clock(server_micros);
                 self.resolve_action(cid, None);
                 // Outbox calls: the goal is reached → retire (no-op for non-Outbox
                 // cids, e.g. a propose handled by `resolve_action` above).
@@ -1758,7 +1758,7 @@ impl Client {
                 // A gate `time_drift` rejection re-seats the clock toward server,
                 // using this call's recorded send instant (RTT midpoint).
                 self.note_drift(cid, &error);
-                let mut out = self.sample_clock(&server_micros);
+                let mut out = self.sample_clock(server_micros);
                 self.resolve_action(cid, Some(&error));
                 // Outbox calls: re-queue with exponential back-off (no latch).
                 self.outbox.on_err(cid, self.perf_ms);
@@ -1772,7 +1772,7 @@ impl Client {
                 // `Awaiting` state until the gate resolves it (a later CallOk/CallErr
                 // on this cid) or `timeout_ms` elapses → retry. A promise is still a
                 // round-trip → a clock sample + an RTT slot to free.
-                let out = self.sample_clock(&server_micros);
+                let out = self.sample_clock(server_micros);
                 self.outbox.on_promise(cid, timeout_ms as f64, self.perf_ms);
                 self.record_rtt(cid);
                 self.inflight_calls.remove(&cid);
@@ -1786,27 +1786,25 @@ impl Client {
             // Live observer count for a zone. Store it (drives the move-sync gate),
             // and on a ≤1→>1 transition flush any dirty cards in that zone so the
             // newly-arrived observer sees their true positions.
-            GateMsg::ZoneObservers { macro_zone, observers } => {
-                if let Ok(zone) = macro_zone.parse::<u64>() {
-                    let prev = self.zone_observers.get(&zone).copied().unwrap_or(0);
-                    if observers <= 1 {
-                        self.zone_observers.remove(&zone);
-                    } else {
-                        self.zone_observers.insert(zone, observers);
-                    }
-                    if prev <= 1 && observers > 1 {
-                        let now = self.clock_ms;
-                        let ids: Vec<u32> = self
-                            .dirty_positions
-                            .iter()
-                            .copied()
-                            .filter(|&id| {
-                                self.world.cards.current(id, now).is_some_and(|c| c.macro_zone == zone)
-                            })
-                            .collect();
-                        if let Some(frame) = self.build_move_cards(&ids) {
-                            self.pending_out.push(frame);
-                        }
+            GateMsg::ZoneObservers { macro_zone: zone, observers } => {
+                let prev = self.zone_observers.get(&zone).copied().unwrap_or(0);
+                if observers <= 1 {
+                    self.zone_observers.remove(&zone);
+                } else {
+                    self.zone_observers.insert(zone, observers);
+                }
+                if prev <= 1 && observers > 1 {
+                    let now = self.clock_ms;
+                    let ids: Vec<u32> = self
+                        .dirty_positions
+                        .iter()
+                        .copied()
+                        .filter(|&id| {
+                            self.world.cards.current(id, now).is_some_and(|c| c.macro_zone == zone)
+                        })
+                        .collect();
+                    if let Some(frame) = self.build_move_cards(&ids) {
+                        self.pending_out.push(frame);
                     }
                 }
                 vec![]
@@ -2278,15 +2276,10 @@ impl Client {
 
     /// Fold a server-time sample into the [`ClockSync`] discipline and refresh
     /// the cached estimate. Emits `Clock` with the (behind-true-server) estimate.
-    fn sample_clock(&mut self, server_micros: &str) -> Vec<Event> {
-        match server_micros.parse::<u64>() {
-            Ok(us) => {
-                self.clock.note_sample(us as f64 / 1_000.0, self.perf_ms);
-                self.clock_ms = self.clock.server_now_ms(self.perf_ms).max(0.0) as u64;
-                vec![Event::Clock { ms: self.clock_ms }]
-            }
-            Err(_) => vec![],
-        }
+    fn sample_clock(&mut self, server_micros: u64) -> Vec<Event> {
+        self.clock.note_sample(server_micros as f64 / 1_000.0, self.perf_ms);
+        self.clock_ms = self.clock.server_now_ms(self.perf_ms).max(0.0) as u64;
+        vec![Event::Clock { ms: self.clock_ms }]
     }
 
     /// Fold a resolved call's round-trip time (`reply_perf − send_perf`) into the
@@ -2834,7 +2827,7 @@ mod tests {
         // behind true server time by `client_delay` (the discipline is unit-tested
         // in clock.rs); here we only assert an event fires.
         assert!(matches!(
-            c.apply(GateMsg::Time { server_micros: "5000000".to_string() }).as_slice(),
+            c.apply(GateMsg::Time { server_micros: 5_000_000 }).as_slice(),
             [Event::Clock { .. }]
         ));
         // Outbound calls stamp `client_time_ms` from the cached estimate. Set it
@@ -2967,7 +2960,7 @@ mod tests {
         assert!(c.pending_out.is_empty(), "private-zone move stays local");
 
         // The gate reports the world zone is SHARED (2 observers).
-        c.apply(GateMsg::ZoneObservers { macro_zone: world.to_string(), observers: 2 });
+        c.apply(GateMsg::ZoneObservers { macro_zone: world, observers: 2 });
         assert_eq!(c.zone_observers.get(&world).copied(), Some(2));
         // The earlier dirty card 3000 is in that zone → the ≤1→>1 flush syncs it.
         assert!(matches!(c.pending_out.first(), Some(ClientMsg::Call { call, .. }) if call.reducer() == "move_cards"));
@@ -3086,7 +3079,7 @@ mod tests {
         for f in &first {
             if let ClientMsg::Call { cid, call, .. } = f {
                 if call.reducer() == "request_zone" {
-                    c.apply(GateMsg::CallOk { cid: *cid, server_micros: String::new() });
+                    c.apply(GateMsg::CallOk { cid: *cid, server_micros: 0 });
                 }
             }
         }
@@ -3294,10 +3287,12 @@ mod tests {
     #[test]
     fn call_replies_and_protocol_errors_surface() {
         let mut c = Client::new();
-        assert_eq!(c.apply(GateMsg::CallOk { cid: 3, server_micros: "0".to_string() }),
+        assert_eq!(c.apply(GateMsg::CallOk { cid: 3, server_micros: 0 }),
                    vec![Event::Clock { ms: 0 }, Event::CallOk { cid: 3 }]);
-        assert_eq!(c.apply(GateMsg::CallErr { cid: 4, error: "nope".to_string(), server_micros: "".to_string() }),
-                   vec![Event::CallErr { cid: 4, error: "nope".to_string() }]);
+        // A rejected call is still a round-trip → a valid clock sample, same as
+        // CallOk (native u64 server_micros: every reply samples the clock now).
+        assert_eq!(c.apply(GateMsg::CallErr { cid: 4, error: "nope".to_string(), server_micros: 0 }),
+                   vec![Event::Clock { ms: 0 }, Event::CallErr { cid: 4, error: "nope".to_string() }]);
         assert_eq!(c.apply(GateMsg::Error { error: "bad".to_string() }),
                    vec![Event::Error { error: "bad".to_string() }]);
     }

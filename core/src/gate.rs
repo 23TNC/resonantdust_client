@@ -77,7 +77,7 @@ mod tests {
     #[tokio::test]
     async fn serializes_outbound_and_parses_inbound() {
         let mut t = MockTransport::default();
-        t.incoming.push_back(GateMsg::Time { server_micros: "123".to_string() }.to_bytes());
+        t.incoming.push_back(GateMsg::Time { server_micros: 123 }.to_bytes());
         t.incoming.push_back(GateMsg::Applied { sid: 1 }.to_bytes());
         {
             let mut conn = GateConnection::new(&mut t);
