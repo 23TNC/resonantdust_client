@@ -208,8 +208,9 @@ impl SubStats {
 pub struct WasmClient {
     core: Client,
     ws: Option<WebSocket>,
-    /// Inbound frames the WS `onmessage` callback parks until the next `pump`.
-    incoming: Rc<RefCell<VecDeque<String>>>,
+    /// Inbound frames (raw bytes) the WS `onmessage` callback parks until the
+    /// next `pump`.
+    incoming: Rc<RefCell<VecDeque<Vec<u8>>>>,
     /// Flipped true by the WS `onopen` callback.
     open: Rc<RefCell<bool>>,
     // Closures must outlive the WS — dropping them detaches the handlers.
@@ -249,11 +250,18 @@ impl WasmClient {
     /// the socket is *created*; poll [`is_open`](Self::is_open) for the handshake.
     pub fn connect(&mut self, ws_url: &str) -> Result<(), JsValue> {
         let ws = WebSocket::new(ws_url)?;
+        // The wire is binary frames; deliver them as ArrayBuffer (not Blob) so the
+        // sync `onmessage` can copy bytes out without an async read.
+        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
 
         let incoming = self.incoming.clone();
         let onmessage = Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-            if let Some(txt) = e.data().as_string() {
-                incoming.borrow_mut().push_back(txt);
+            // Binary frame → ArrayBuffer → Vec<u8>. (A stray text frame, which the
+            // gate no longer sends, is ignored.)
+            let data = e.data();
+            if let Ok(buf) = data.dyn_into::<js_sys::ArrayBuffer>() {
+                let bytes = js_sys::Uint8Array::new(&buf).to_vec();
+                incoming.borrow_mut().push_back(bytes);
             }
         });
         ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
@@ -510,9 +518,9 @@ impl WasmClient {
         // against real local time.
         self.core.tick(now);
         // Drain into a Vec first so the queue borrow is released before `apply`.
-        let frames: Vec<String> = self.incoming.borrow_mut().drain(..).collect();
+        let frames: Vec<Vec<u8>> = self.incoming.borrow_mut().drain(..).collect();
         for raw in frames {
-            if let Ok(msg) = serde_json::from_str::<GateMsg>(&raw) {
+            if let Ok(msg) = serde_json::from_slice::<GateMsg>(&raw) {
                 // Tally call replies (by cid → reducer) + subscription data (by
                 // table) before `apply` consumes the frame; `raw.len()` is the
                 // rx-bytes estimate.
@@ -683,16 +691,17 @@ impl WasmClient {
     fn send(&mut self, frames: &[ClientMsg]) {
         if let Some(ws) = &self.ws {
             for m in frames {
-                if let Ok(s) = serde_json::to_string(m) {
+                // ClientMsg is still JSON, now carried over a binary frame.
+                if let Ok(bytes) = serde_json::to_vec(m) {
                     match m {
                         ClientMsg::Call { cid, reducer, .. } => {
-                            self.stats.note_send(*cid, reducer, s.len());
+                            self.stats.note_send(*cid, reducer, bytes.len());
                         }
                         ClientMsg::Sub { .. } | ClientMsg::Unsub { .. } => {
-                            self.subs.note_send(m, s.len());
+                            self.subs.note_send(m, bytes.len());
                         }
                     }
-                    let _ = ws.send_with_str(&s);
+                    let _ = ws.send_with_u8_array(&bytes);
                 }
             }
         }

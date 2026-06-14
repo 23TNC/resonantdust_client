@@ -1,8 +1,8 @@
 //! Gate framing over a [`Transport`].
 //!
-//! The thin seam between the byte pipe ([`Transport`], raw JSON strings) and the
+//! The thin seam between the byte pipe ([`Transport`], raw frames) and the
 //! sans-IO logic core ([`crate::client::Client`], typed `ClientMsg`/`GateMsg`):
-//! it just does the serde. The core owns subscription/call id allocation and all
+//! it just does the encode/decode. The core owns subscription/call id allocation and all
 //! state — this layer is stateless. Shared by the NPC (native) and browser
 //! (wasm) builds; only the [`Transport`] underneath differs.
 //!
@@ -25,9 +25,11 @@ impl<T: Transport> GateConnection<T> {
         Self { transport }
     }
 
-    /// Serialize and send one outbound message.
+    /// Encode and send one outbound message. The transport carries bytes; the
+    /// `ClientMsg` direction is still JSON (utf-8) here — postcard lands in a
+    /// later phase, independently of `GateMsg`.
     pub async fn send(&mut self, msg: &ClientMsg) -> anyhow::Result<()> {
-        self.transport.send(serde_json::to_string(msg)?).await
+        self.transport.send(serde_json::to_vec(msg)?).await
     }
 
     /// Send a batch in order — e.g. the frames a single [`crate::client::Command`]
@@ -42,7 +44,7 @@ impl<T: Transport> GateConnection<T> {
     /// The next inbound gate frame, parsed — or `None` at EOF.
     pub async fn next(&mut self) -> anyhow::Result<Option<GateMsg>> {
         match self.transport.recv().await? {
-            Some(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+            Some(raw) => Ok(Some(serde_json::from_slice(&raw)?)),
             None => Ok(None),
         }
     }
@@ -57,16 +59,16 @@ mod tests {
     /// The whole framing path is exercised with zero network.
     #[derive(Default)]
     struct MockTransport {
-        sent: Vec<String>,
-        incoming: VecDeque<String>,
+        sent: Vec<Vec<u8>>,
+        incoming: VecDeque<Vec<u8>>,
     }
 
     impl Transport for &mut MockTransport {
-        async fn send(&mut self, frame: String) -> anyhow::Result<()> {
+        async fn send(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
             self.sent.push(frame);
             Ok(())
         }
-        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+        async fn recv(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
             Ok(self.incoming.pop_front())
         }
     }
@@ -74,8 +76,8 @@ mod tests {
     #[tokio::test]
     async fn serializes_outbound_and_parses_inbound() {
         let mut t = MockTransport::default();
-        t.incoming.push_back(r#"{"t":"time","server_micros":"123"}"#.to_string());
-        t.incoming.push_back(r#"{"t":"applied","sid":1}"#.to_string());
+        t.incoming.push_back(br#"{"t":"time","server_micros":"123"}"#.to_vec());
+        t.incoming.push_back(br#"{"t":"applied","sid":1}"#.to_vec());
         {
             let mut conn = GateConnection::new(&mut t);
             conn.send_all(&[
@@ -88,7 +90,7 @@ mod tests {
             assert!(matches!(conn.next().await.unwrap(), Some(GateMsg::Applied { sid: 1 })));
             assert!(conn.next().await.unwrap().is_none(), "EOF when drained");
         }
-        assert_eq!(t.sent[0], r#"{"t":"sub","sid":1,"table":"cards"}"#);
-        assert_eq!(t.sent[1], r#"{"t":"call","cid":1,"reducer":"ping","args":{}}"#);
+        assert_eq!(t.sent[0], br#"{"t":"sub","sid":1,"table":"cards"}"#);
+        assert_eq!(t.sent[1], br#"{"t":"call","cid":1,"reducer":"ping","args":{}}"#);
     }
 }

@@ -1,21 +1,25 @@
 //! Transport seam.
 //!
 //! The client speaks the gate protocol ([`resonantdust_protocol::protocol`]) over
-//! *some* duplex channel of JSON text frames. This trait is that seam: the
-//! native build (here) uses a real WebSocket via tokio-tungstenite; the browser
-//! build will implement the same trait over a `web-sys` WebSocket — the wasm
-//! client owns the socket. Everything above this (serde, subscription
-//! bookkeeping, prediction) is transport-agnostic and shared.
+//! *some* duplex channel of binary frames. This trait is that seam: the native
+//! build (here) uses a real WebSocket via tokio-tungstenite; the browser build
+//! implements the same trait over a `web-sys` WebSocket — the wasm client owns
+//! the socket. Everything above this (serde, subscription bookkeeping,
+//! prediction) is transport-agnostic and shared.
+//!
+//! Frames are raw bytes (WebSocket *binary* frames). The protocol layer above
+//! does the encode/decode — JSON-over-bytes today, migrating to postcard
+//! per-direction — so the transport stays a dumb byte pipe either way.
 
-/// A duplex channel of JSON text frames to/from a gateway. Frames are raw
-/// strings here — the protocol layer above does the `ClientMsg`/`GateMsg` serde,
-/// so the transport stays a dumb pipe that any backend can satisfy.
+/// A duplex channel of binary frames to/from a gateway. The protocol layer above
+/// does the `ClientMsg`/`GateMsg` encode/decode, so the transport stays a dumb
+/// pipe that any backend can satisfy.
 #[allow(async_fn_in_trait)] // single-task client; no `dyn Transport` / Send bound needed yet
 pub trait Transport {
-    /// Send one frame (a serialized `ClientMsg`).
-    async fn send(&mut self, frame: String) -> anyhow::Result<()>;
-    /// Receive the next frame (a serialized `GateMsg`), or `None` at EOF.
-    async fn recv(&mut self) -> anyhow::Result<Option<String>>;
+    /// Send one frame (an encoded `ClientMsg`).
+    async fn send(&mut self, frame: Vec<u8>) -> anyhow::Result<()>;
+    /// Receive the next frame (an encoded `GateMsg`), or `None` at EOF.
+    async fn recv(&mut self) -> anyhow::Result<Option<Vec<u8>>>;
 }
 
 // Native WebSocket transport — NPC driver + integration tests. Excluded from
@@ -43,16 +47,18 @@ mod native {
     }
 
     impl Transport for WsTransport {
-        async fn send(&mut self, frame: String) -> anyhow::Result<()> {
-            self.ws.send(Message::Text(frame.into())).await?;
+        async fn send(&mut self, frame: Vec<u8>) -> anyhow::Result<()> {
+            self.ws.send(Message::Binary(frame.into())).await?;
             Ok(())
         }
 
-        async fn recv(&mut self) -> anyhow::Result<Option<String>> {
+        async fn recv(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
             while let Some(msg) = self.ws.next().await {
                 match msg? {
-                    Message::Text(t) => return Ok(Some(t.to_string())),
-                    Message::Binary(b) => return Ok(Some(String::from_utf8_lossy(&b).into_owned())),
+                    Message::Binary(b) => return Ok(Some(b.to_vec())),
+                    // Tolerate a text frame (shouldn't occur now the wire is
+                    // binary) by surfacing its bytes.
+                    Message::Text(t) => return Ok(Some(t.as_bytes().to_vec())),
                     // tungstenite auto-replies to pings; nothing to surface.
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(_) => return Ok(None),
