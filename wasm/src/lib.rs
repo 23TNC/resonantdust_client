@@ -21,7 +21,7 @@ use resonantdust_codec::packed::{
     pack_definition, pack_macro_zone_full, surface_of, tile_full, tile_slot, unpack_macro_zone,
     unpack_zone_definition, world_tile, zone_local, INVENTORY_LAYER, ZONE_SIZE,
 };
-use resonantdust_protocol::protocol::{ClientMsg, GateMsg};
+use resonantdust_protocol::protocol::{ClientCall, ClientMsg, GateMsg};
 
 use resonantdust_client_core::client::{Client, Command, Event};
 use resonantdust_client_core::content;
@@ -394,14 +394,13 @@ impl WasmClient {
         data_b64: &str,
     ) {
         let frames = self.core.dispatch(Command::Call {
-            reducer: "upload_master".to_string(),
-            args: serde_json::json!({
-                "aspect": aspect,
-                "faction": faction,
-                "variant": variant,
-                "channel": channel,
-                "data": data_b64,
-            }),
+            call: ClientCall::UploadMaster {
+                aspect: aspect.to_string(),
+                faction: faction.to_string(),
+                variant: variant.to_string(),
+                channel: channel.to_string(),
+                data: data_b64.to_string(),
+            },
         });
         self.send(&frames);
     }
@@ -412,8 +411,7 @@ impl WasmClient {
     /// `content_changed`. Fire-and-forget — gated on the content-author capability.
     pub fn modify_content(&mut self, lineage: &str, text: &str) {
         let frames = self.core.dispatch(Command::Call {
-            reducer: "modify_content".to_string(),
-            args: serde_json::json!({ "lineage": lineage, "text": text }),
+            call: ClientCall::ModifyContent { lineage: lineage.to_string(), text: text.to_string() },
         });
         self.send(&frames);
     }
@@ -423,8 +421,7 @@ impl WasmClient {
     /// persist + `content_changed` as `modify_content`.
     pub fn add_content(&mut self, name: &str, text: &str) {
         let frames = self.core.dispatch(Command::Call {
-            reducer: "add_content".to_string(),
-            args: serde_json::json!({ "name": name, "text": text }),
+            call: ClientCall::AddContent { name: name.to_string(), text: text.to_string() },
         });
         self.send(&frames);
     }
@@ -434,8 +431,7 @@ impl WasmClient {
     /// forget — gated on the content-author capability.
     pub fn modify_locale(&mut self, domain: &str, json: &str) {
         let frames = self.core.dispatch(Command::Call {
-            reducer: "modify_locale".to_string(),
-            args: serde_json::json!({ "domain": domain, "json": json }),
+            call: ClientCall::ModifyLocale { domain: domain.to_string(), json: json.to_string() },
         });
         self.send(&frames);
     }
@@ -445,8 +441,7 @@ impl WasmClient {
     /// `content_changed`. Fire-and-forget — gated on the content-author capability.
     pub fn modify_visuals(&mut self, name: &str, text: &str) {
         let frames = self.core.dispatch(Command::Call {
-            reducer: "modify_visuals".to_string(),
-            args: serde_json::json!({ "name": name, "text": text }),
+            call: ClientCall::ModifyVisuals { name: name.to_string(), text: text.to_string() },
         });
         self.send(&frames);
     }
@@ -691,18 +686,17 @@ impl WasmClient {
     fn send(&mut self, frames: &[ClientMsg]) {
         if let Some(ws) = &self.ws {
             for m in frames {
-                // ClientMsg is still JSON, now carried over a binary frame.
-                if let Ok(bytes) = serde_json::to_vec(m) {
-                    match m {
-                        ClientMsg::Call { cid, reducer, .. } => {
-                            self.stats.note_send(*cid, reducer, bytes.len());
-                        }
-                        ClientMsg::Sub { .. } | ClientMsg::Unsub { .. } => {
-                            self.subs.note_send(m, bytes.len());
-                        }
+                // ClientMsg is postcard-encoded now.
+                let bytes = m.to_bytes();
+                match m {
+                    ClientMsg::Call { cid, call, .. } => {
+                        self.stats.note_send(*cid, call.reducer(), bytes.len());
                     }
-                    let _ = ws.send_with_u8_array(&bytes);
+                    ClientMsg::Sub { .. } | ClientMsg::Unsub { .. } => {
+                        self.subs.note_send(m, bytes.len());
+                    }
                 }
+                let _ = ws.send_with_u8_array(&bytes);
             }
         }
     }

@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use resonantdust_dsl::bridge::Card;
 use resonantdust_codec::card_model::{stack_branch, stack_index};
 use resonantdust_dsl::loader::Bundle;
-use resonantdust_protocol::protocol::{ClientMsg, GateMsg, RowOp};
+use resonantdust_protocol::protocol::{ClientCall, ClientMsg, GateMsg, RowOp};
 use resonantdust_dsl::recipe::{build_frame, iterators};
 use resonantdust_state::recipe_state::CardStore;
 use resonantdust_state::stack::{self, plan_place, StackStore};
@@ -79,10 +79,10 @@ pub enum Command {
     /// the next requested as each prior step's row arrives). A no-op if already
     /// there or no path. Re-issuing replaces any in-flight movement (path change).
     MoveTo { soul: u32, target_q: i32, target_r: i32 },
-    /// Escape hatch: call an arbitrary gate/shard reducer. (Typed commands for
-    /// place_card / propose_action land as the action path grows.)
+    /// Escape hatch: call a reducer directly via a typed [`ClientCall`] (e.g. the
+    /// content/art-authoring ops the wasm surface exposes).
     #[allow(dead_code)]
-    Call { reducer: String, args: serde_json::Value },
+    Call { call: ClientCall },
 }
 
 /// An in-flight pipelined movement for one soul. The client requests step N+1 the
@@ -580,11 +580,9 @@ impl Client {
         self.next_cid = next;
         for o in outgoing {
             self.inflight_calls.insert(o.cid, (self.perf_ms, clock));
-            let mut args = o.args;
-            if let Some(obj) = args.as_object_mut() {
-                obj.insert("client_time_ms".to_string(), serde_json::json!(clock));
-            }
-            out.push(ClientMsg::Call { cid: o.cid, reducer: o.reducer, args });
+            // `client_time_ms` rides top-level now (the gate folds it into the
+            // timed reducers' args); the outbox call carries only stable fields.
+            out.push(ClientMsg::Call { cid: o.cid, client_time_ms: clock, call: o.call });
         }
         out
     }
@@ -612,8 +610,8 @@ impl Client {
                 let cid = self.cid();
                 let login = ClientMsg::Call {
                     cid,
-                    reducer: "claim_or_login".to_string(),
-                    args: serde_json::json!({ "client_time_ms": self.clock_ms, "name": name }),
+                    client_time_ms: self.clock_ms,
+                    call: ClientCall::ClaimOrLogin { name: name.clone() },
                 };
                 let watch = ClientMsg::Sub {
                     sid: self.sid(),
@@ -633,16 +631,15 @@ impl Client {
             Command::CreateCard { owner, card_key, surface, macro_zone, q, r } => {
                 vec![ClientMsg::Call {
                     cid: self.cid(),
-                    reducer: "create_card".to_string(),
-                    args: serde_json::json!({
-                        "client_time_ms": self.clock_ms,
-                        "owner_id": owner,
-                        "surface": surface,
-                        "card_key": card_key,
-                        "macro_zone": macro_zone,
-                        "q": q,
-                        "r": r,
-                    }),
+                    client_time_ms: self.clock_ms,
+                    call: ClientCall::CreateCard {
+                        owner_id: owner,
+                        surface,
+                        card_key,
+                        macro_zone,
+                        q,
+                        r,
+                    },
                 }]
             }
             Command::Subscribe { table, filter } => {
@@ -659,8 +656,8 @@ impl Client {
             Command::MoveTo { soul, target_q, target_r } => {
                 self.start_move_to(soul, target_q, target_r)
             }
-            Command::Call { reducer, args } => {
-                vec![ClientMsg::Call { cid: self.cid(), reducer, args }]
+            Command::Call { call } => {
+                vec![ClientMsg::Call { cid: self.cid(), client_time_ms: self.clock_ms, call }]
             }
         }
     }
@@ -690,12 +687,12 @@ impl Client {
     pub fn send_chat(&mut self, body: String) -> Vec<ClientMsg> {
         vec![ClientMsg::Call {
             cid: self.cid(),
-            reducer: "send_chat_message".to_string(),
-            args: serde_json::json!({
-                "sender_player_id": self.player_id.unwrap_or(0),
-                "sender_name": self.name.clone().unwrap_or_default(),
-                "body": body,
-            }),
+            client_time_ms: self.clock_ms,
+            call: ClientCall::SendChatMessage {
+                sender_player_id: self.player_id.unwrap_or(0),
+                sender_name: self.name.clone().unwrap_or_default(),
+                body,
+            },
         }]
     }
 
@@ -777,13 +774,13 @@ impl Client {
                     let (region, _) = region_of_zone(zone);
                     let h = call_hash("ensure_region", region);
                     if want.insert(h) {
-                        self.outbox.want(h, "ensure_region", serde_json::json!({ "macro_zone": zone }), now);
+                        self.outbox.want(h, ClientCall::EnsureRegion { macro_zone: zone }, now);
                     }
                 }
                 crate::zones::ZoneNeed::Request => {
                     let h = call_hash("request_zone", zone);
                     want.insert(h);
-                    self.outbox.want(h, "request_zone", serde_json::json!({ "macro_zone": zone }), now);
+                    self.outbox.want(h, ClientCall::RequestZone { macro_zone: zone }, now);
                 }
                 crate::zones::ZoneNeed::Satisfied => {}
             }
@@ -1088,15 +1085,14 @@ impl Client {
         let cid = self.cid();
         Some(ClientMsg::Call {
             cid,
-            reducer: "move_cards".to_string(),
-            args: serde_json::json!({
-                "client_time_ms": now,
-                "caller_player_id": caller,
-                "card_ids": card_ids,
-                "macro_zones": macro_zones,
-                "micro_locations": micros,
-                "stack_states": stacks,
-            }),
+            client_time_ms: now,
+            call: ClientCall::MoveCards {
+                caller_player_id: caller,
+                card_ids,
+                macro_zones,
+                micro_locations: micros,
+                stack_states: stacks,
+            },
         })
     }
 
@@ -1161,18 +1157,19 @@ impl Client {
         // prediction the server validates — a lie just gets the move rejected.
         let frame = ClientMsg::Call {
             cid,
-            reducer: "move_soul".to_string(),
-            args: serde_json::json!({
-                "client_time_ms": self.clock_ms,
-                "caller_player_id": caller,
-                "soul_id": soul,
-                "soul_def": soul_def,
-                "from_q": from.0,
-                "from_r": from.1,
-                "dest": { "surface": WORLD_LAYER, "macro_zone": dest_macro, "micro_location": dest_micro },
-                "depart_ms": depart_ms,
-                "arrival_ms": arrival_ms,
-            }),
+            client_time_ms: self.clock_ms,
+            call: ClientCall::MoveSoul {
+                caller_player_id: caller,
+                soul_id: soul,
+                soul_def,
+                from_q: from.0,
+                from_r: from.1,
+                dest_surface: WORLD_LAYER,
+                dest_macro_zone: dest_macro,
+                dest_micro_location: dest_micro,
+                depart_ms,
+                arrival_ms,
+            },
         };
         Some((frame, arrival_ms))
     }
@@ -1363,17 +1360,16 @@ impl Client {
         let cid = self.cid();
         out.push(ClientMsg::Call {
             cid,
-            reducer: "propose_action".to_string(),
-            args: serde_json::json!({
-                "recipe_id": recipe_id,
-                "surface": surface,
-                "macro_zone": macro_zone,
-                "micro_location": micro_location,
-                "root": root,
-                "bindings": bindings,
-                "caller_player_id": caller,
-                "client_time_ms": self.clock_ms,
-            }),
+            client_time_ms: self.clock_ms,
+            call: ClientCall::ProposeAction {
+                recipe_id,
+                surface,
+                macro_zone,
+                micro_location,
+                root,
+                bindings,
+                caller_player_id: caller,
+            },
         });
         Ok(out)
     }
@@ -2780,16 +2776,16 @@ mod tests {
             other => panic!("expected sub, got {other:?}"),
         }
         match &frames[1] {
-            ClientMsg::Call { cid, reducer, args } => {
-                assert_eq!((*cid, reducer.as_str()), (1, "claim_or_login"));
-                assert_eq!(args["name"], "ann");
+            ClientMsg::Call { cid, call, .. } => {
+                assert_eq!(*cid, 1);
+                assert!(matches!(call, ClientCall::ClaimOrLogin { name } if name == "ann"));
             }
             other => panic!("expected call, got {other:?}"),
         }
         // ids count up independently across subsequent dispatches.
         let more = c.dispatch(Command::Subscribe { table: "cards".to_string(), filter: None });
         assert!(matches!(&more[0], ClientMsg::Sub { sid: 2, .. }));
-        let call = c.dispatch(Command::Call { reducer: "ping".to_string(), args: serde_json::json!({}) });
+        let call = c.dispatch(Command::Call { call: ClientCall::Ping });
         assert!(matches!(&call[0], ClientMsg::Call { cid: 2, .. }));
     }
 
@@ -2824,10 +2820,8 @@ mod tests {
             r: 0,
         });
         match &frames[0] {
-            ClientMsg::Call { reducer, args, .. } => {
-                assert_eq!(reducer, "create_card");
-                assert_eq!(args["owner_id"], 1024);
-                assert_eq!(args["card_key"], "player_soul");
+            ClientMsg::Call { call, .. } => {
+                assert!(matches!(call, ClientCall::CreateCard { owner_id: 1024, card_key, .. } if card_key == "player_soul"));
             }
             other => panic!("expected call, got {other:?}"),
         }
@@ -2856,7 +2850,7 @@ mod tests {
             r: 0,
         });
         match &spawn[0] {
-            ClientMsg::Call { args, .. } => assert_eq!(args["client_time_ms"], 5000),
+            ClientMsg::Call { client_time_ms, .. } => assert_eq!(*client_time_ms, 5000),
             other => panic!("expected call, got {other:?}"),
         }
     }
@@ -2922,10 +2916,8 @@ mod tests {
         // Flushing the dirty set emits ONE batched move_cards call, then clears.
         let flush = c.flush_positions();
         match &flush[0] {
-            ClientMsg::Call { reducer, args, .. } => {
-                assert_eq!(reducer, "move_cards");
-                assert_eq!(args["card_ids"][0], 2000);
-                assert_eq!(args["caller_player_id"], 7);
+            ClientMsg::Call { call, .. } => {
+                assert!(matches!(call, ClientCall::MoveCards { card_ids, caller_player_id: 7, .. } if card_ids[0] == 2000));
             }
             other => panic!("expected move_cards call, got {other:?}"),
         }
@@ -2978,14 +2970,14 @@ mod tests {
         c.apply(GateMsg::ZoneObservers { macro_zone: world.to_string(), observers: 2 });
         assert_eq!(c.zone_observers.get(&world).copied(), Some(2));
         // The earlier dirty card 3000 is in that zone → the ≤1→>1 flush syncs it.
-        assert!(matches!(c.pending_out.first(), Some(ClientMsg::Call { reducer, .. }) if reducer == "move_cards"));
+        assert!(matches!(c.pending_out.first(), Some(ClientMsg::Call { call, .. }) if call.reducer() == "move_cards"));
         c.pending_out.clear();
 
         // A NEW move in the now-shared zone syncs immediately.
         c.place(3001, stack::Placement::Loose { surface: WORLD_LAYER, macro_zone: world, q: 1, r: 1, x: 0, y: 0 })
             .unwrap();
         assert!(
-            matches!(c.pending_out.first(), Some(ClientMsg::Call { reducer, .. }) if reducer == "move_cards"),
+            matches!(c.pending_out.first(), Some(ClientMsg::Call { call, .. }) if call.reducer() == "move_cards"),
             "move in a shared zone syncs immediately"
         );
     }
@@ -3009,8 +3001,8 @@ mod tests {
     fn count_sub<'a>(frames: &'a [ClientMsg], table: &str) -> usize {
         frames.iter().filter(|f| matches!(f, ClientMsg::Sub { table: t, .. } if t == table)).count()
     }
-    fn count_call<'a>(frames: &'a [ClientMsg], reducer: &str) -> usize {
-        frames.iter().filter(|f| matches!(f, ClientMsg::Call { reducer: r, .. } if r == reducer)).count()
+    fn count_call(frames: &[ClientMsg], reducer: &str) -> usize {
+        frames.iter().filter(|f| matches!(f, ClientMsg::Call { call, .. } if call.reducer() == reducer)).count()
     }
 
     #[test]
@@ -3092,8 +3084,8 @@ mod tests {
         // Every request comes back `call_ok` — but the region's `available` bits are
         // STILL clear (the lie). The old latch would mark them done forever.
         for f in &first {
-            if let ClientMsg::Call { cid, reducer, .. } = f {
-                if reducer == "request_zone" {
+            if let ClientMsg::Call { cid, call, .. } = f {
+                if call.reducer() == "request_zone" {
                     c.apply(GateMsg::CallOk { cid: *cid, server_micros: String::new() });
                 }
             }

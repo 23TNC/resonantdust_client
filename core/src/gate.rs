@@ -10,6 +10,8 @@
 //! monomorphized and Send-free for the single-task client loop.
 
 use resonantdust_protocol::protocol::{ClientMsg, GateMsg};
+#[cfg(test)]
+use resonantdust_protocol::protocol::ClientCall;
 
 use crate::transport::Transport;
 
@@ -25,11 +27,9 @@ impl<T: Transport> GateConnection<T> {
         Self { transport }
     }
 
-    /// Encode and send one outbound message. The transport carries bytes; the
-    /// `ClientMsg` direction is still JSON (utf-8) here — postcard lands in a
-    /// later phase, independently of `GateMsg`.
+    /// Encode and send one outbound message (postcard binary).
     pub async fn send(&mut self, msg: &ClientMsg) -> anyhow::Result<()> {
-        self.transport.send(serde_json::to_vec(msg)?).await
+        self.transport.send(msg.to_bytes()).await
     }
 
     /// Send a batch in order — e.g. the frames a single [`crate::client::Command`]
@@ -83,7 +83,7 @@ mod tests {
             let mut conn = GateConnection::new(&mut t);
             conn.send_all(&[
                 ClientMsg::Sub { sid: 1, table: "cards".to_string(), filter: None },
-                ClientMsg::Call { cid: 1, reducer: "ping".to_string(), args: serde_json::json!({}) },
+                ClientMsg::Call { cid: 1, client_time_ms: 0, call: ClientCall::Ping },
             ])
             .await
             .unwrap();
@@ -91,7 +91,14 @@ mod tests {
             assert!(matches!(conn.next().await.unwrap(), Some(GateMsg::Applied { sid: 1 })));
             assert!(conn.next().await.unwrap().is_none(), "EOF when drained");
         }
-        assert_eq!(t.sent[0], br#"{"t":"sub","sid":1,"table":"cards"}"#);
-        assert_eq!(t.sent[1], br#"{"t":"call","cid":1,"reducer":"ping","args":{}}"#);
+        // Outbound rides postcard now — decode to assert.
+        assert!(matches!(
+            postcard::from_bytes::<ClientMsg>(&t.sent[0]).unwrap(),
+            ClientMsg::Sub { sid: 1, .. }
+        ));
+        assert!(matches!(
+            postcard::from_bytes::<ClientMsg>(&t.sent[1]).unwrap(),
+            ClientMsg::Call { cid: 1, call: ClientCall::Ping, .. }
+        ));
     }
 }
