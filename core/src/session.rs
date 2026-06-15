@@ -577,12 +577,14 @@ impl Session {
     /// known-wood forest tile in our anchor zone (3,3). Verify `cut_tree`
     /// auto-proposes, fires, and yields `corpus_dim` + `log` into our inventory
     /// with the source corpus destroyed. `tile` is the local (lq, lr) cell.
-    /// Magnetic-recipe spike: place a `despair` magnet + a `dread` candidate
-    /// adjacent on the world, BOTH owned by this client's player_soul — so this
-    /// client acts as the magnetic player that owns + drives them. Asserts the
-    /// magnetic pass gathers the dread onto the magnet and `despair_success`
-    /// fires (the magnet is consumed). Proves [`Client::magnetic_pass`] end-to-end.
-    pub async fn run_magnetic(&mut self) -> anyhow::Result<()> {
+    /// Magnetic SUCCESS path: place a `despair` magnet + a `dread` candidate
+    /// adjacent on the world (cells in this client's spawn zone (3,3)), BOTH owned
+    /// by this client's player_soul — so this client acts as the magnetic player
+    /// that owns + drives them. Asserts the magnetic pass gathers the dread onto
+    /// the magnet and `despair_success` fires (the magnet is consumed). Cells are
+    /// caller-chosen so several magnetic tests can share the zone without colliding.
+    /// Proves [`Client::magnetic_pass`] gather→success end-to-end.
+    pub async fn run_magnetic(&mut self, magnet_cell: (u8, u8), candidate_cell: (u8, u8)) -> anyhow::Result<()> {
         let tag = self.name.clone();
         self.pump(Duration::from_secs(3)).await?;
         let despair = self
@@ -594,10 +596,8 @@ impl Session {
             .player_souls()
             .next()
             .ok_or_else(|| anyhow::anyhow!("[{tag}] no player_soul"))?;
-        // Adjacent world cells in alice's spawn zone (3,3) = tiles 24..31, clear of
-        // her human at (26,26). hex_dist((28,28),(29,28)) = 1, well within radius 3.
         let zone = pack_macro_zone_full(0, WORLD_LAYER, 3, 3);
-        for (key, q, r) in [("despair", 4u8, 4u8), ("dread", 5u8, 4u8)] {
+        for (key, (q, r)) in [("despair", magnet_cell), ("dread", candidate_cell)] {
             self.send(Command::CreateCard {
                 owner: psoul,
                 card_key: key.to_string(),
@@ -609,25 +609,7 @@ impl Session {
             .await?;
             self.await_call().await?;
         }
-        if !self
-            .pump_for_state(Duration::from_secs(5), |c| {
-                c.world()
-                    .cards
-                    .current_all(c.clock_ms())
-                    .any(|r| r.packed_definition == despair && !r.is_dead())
-            })
-            .await?
-        {
-            bail!("[{tag}] despair magnet never discovered");
-        }
-        let magnet = self
-            .core
-            .world()
-            .cards
-            .current_all(self.core.clock_ms())
-            .find(|r| r.packed_definition == despair && !r.is_dead())
-            .map(|r| r.card_id)
-            .unwrap();
+        let magnet = self.discover_magnet(despair, magnet_cell, "despair").await?;
         println!("[{tag}] despair magnet {magnet} placed; magnetic player should gather dread + fire despair_success ...");
         if !self
             .pump_for_state(Duration::from_secs(20), |c| {
@@ -639,6 +621,139 @@ impl Session {
         }
         println!("[{tag}] magnet {magnet} consumed — despair_success fired ✓");
         Ok(())
+    }
+
+    /// Magnetic FAILURE/deadline path: place a short-window `gloom` magnet with NO
+    /// candidate in range, owned by this client's player_soul. When the 4s window
+    /// lapses the client proposes the magnet's `magnetic.failure` (`gloom_failure`),
+    /// which consumes the magnet + spawns a `dread` in the owner's inventory.
+    /// Asserts `gloom_failure` is proposed + gate-accepted AND the magnet dies —
+    /// since no candidate was placed, success can't fire, so this isolates the
+    /// deadline branch of [`Client::magnetic_pass`].
+    pub async fn run_magnetic_failure(&mut self, cell: (u8, u8)) -> anyhow::Result<()> {
+        let tag = self.name.clone();
+        self.pump(Duration::from_secs(1)).await?;
+        let gloom = self
+            .core
+            .packed_def("gloom")
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] no gloom def"))?;
+        let psoul = self
+            .core
+            .player_souls()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] no player_soul"))?;
+        let zone = pack_macro_zone_full(0, WORLD_LAYER, 3, 3);
+        self.send(Command::CreateCard {
+            owner: psoul,
+            card_key: "gloom".to_string(),
+            surface: WORLD_LAYER,
+            macro_zone: zone,
+            q: cell.0,
+            r: cell.1,
+        })
+        .await?;
+        self.await_call().await?;
+        let magnet = self.discover_magnet(gloom, cell, "gloom").await?;
+        println!("[{tag}] gloom magnet {magnet} placed (no candidate); window should lapse → gloom_failure ...");
+
+        // Drive the deadline: the magnetic pass proposes gloom_failure once the 4s
+        // window lapses; wait for its outcome AND the magnet's death. (~4s window +
+        // 2s action.)
+        let mut accepted = false;
+        for _ in 0..40 {
+            self.pump(Duration::from_millis(500)).await?;
+            for (recipe, err) in self.core.drain_action_outcomes() {
+                if recipe == "gloom_failure" {
+                    if let Some(e) = err {
+                        bail!("[{tag}] gloom_failure REJECTED by the gate: {e}");
+                    }
+                    accepted = true;
+                }
+            }
+            let dead = self
+                .core
+                .world()
+                .cards
+                .current(magnet, self.core.clock_ms())
+                .map(|r| r.is_dead())
+                .unwrap_or(false);
+            if accepted && dead {
+                println!("[{tag}] gloom magnet {magnet} consumed — gloom_failure fired (deadline) ✓");
+                return Ok(());
+            }
+        }
+        bail!("[{tag}] gloom_failure never fired (accepted={accepted}) — deadline path broken");
+    }
+
+    /// Place a world card `key` (e.g. a magnet/candidate) owned by this client's
+    /// player_soul at `cell` in the spawn zone (3,3), awaiting the create reply but
+    /// NOT driving any resolution — so a caller can place across several sessions
+    /// then drive them together with [`pump_all`] (the parallel magnetic phase).
+    pub async fn place_world_card(&mut self, key: &str, cell: (u8, u8)) -> anyhow::Result<()> {
+        let psoul = self
+            .core
+            .player_souls()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("[{}] no player_soul", self.name))?;
+        let zone = pack_macro_zone_full(0, WORLD_LAYER, 3, 3);
+        self.send(Command::CreateCard {
+            owner: psoul,
+            card_key: key.to_string(),
+            surface: WORLD_LAYER,
+            macro_zone: zone,
+            q: cell.0,
+            r: cell.1,
+        })
+        .await?;
+        self.await_call().await?;
+        Ok(())
+    }
+
+    /// The card_id of a live loose card of `def` at world cell `cell`, if observed
+    /// (disambiguates this client's magnet from a peer's in the shared zone).
+    pub fn world_loose_at(&self, def: u16, cell: (u8, u8)) -> Option<u32> {
+        let now = self.core.clock_ms();
+        self.core
+            .world()
+            .cards
+            .current_all(now)
+            .find(|r| {
+                r.packed_definition == def
+                    && !r.is_dead()
+                    && matches!(r.micro(), Micro::Loose { local_q, local_r, .. } if (local_q, local_r) == cell)
+            })
+            .map(|r| r.card_id)
+    }
+
+    /// Whether `card_id` is currently dead (consumed) in this client's world.
+    pub fn card_dead(&self, card_id: u32) -> bool {
+        self.core
+            .world()
+            .cards
+            .current(card_id, self.core.clock_ms())
+            .map(|r| r.is_dead())
+            .unwrap_or(false)
+    }
+
+    /// Pump until a magnet of `def` is discovered at `cell`; return its card_id.
+    async fn discover_magnet(&mut self, def: u16, cell: (u8, u8), name: &str) -> anyhow::Result<u32> {
+        let tag = self.name.clone();
+        let at = move |c: &Client| -> Option<u32> {
+            let now = c.clock_ms();
+            c.world()
+                .cards
+                .current_all(now)
+                .find(|r| {
+                    r.packed_definition == def
+                        && !r.is_dead()
+                        && matches!(r.micro(), Micro::Loose { local_q, local_r, .. } if (local_q, local_r) == cell)
+                })
+                .map(|r| r.card_id)
+        };
+        if !self.pump_for_state(Duration::from_secs(5), |c| at(c).is_some()).await? {
+            bail!("[{tag}] {name} magnet never discovered at {cell:?}");
+        }
+        Ok(at(&self.core).unwrap())
     }
 
     pub async fn run_cut_tree(&mut self, tile: (u8, u8)) -> anyhow::Result<()> {

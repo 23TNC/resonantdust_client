@@ -107,7 +107,8 @@ async fn main() -> anyhow::Result<()> {
     // them as the magnetic player) and assert despair_success auto-fires.
     if std::env::var("MAGNETIC_SPIKE").is_ok() {
         if let Some(s) = sessions.first_mut() {
-            s.run_magnetic().await?;
+            s.run_magnetic((4, 4), (5, 4)).await?;
+            s.run_magnetic_failure((1, 1)).await?;
         }
         println!("harness: MAGNETIC SPIKE PASS");
         return Ok(());
@@ -344,6 +345,15 @@ async fn main() -> anyhow::Result<()> {
     // climbing its per-card `progress` stock 0→3 via SetCardStock.
     if let Some(s) = sessions.first_mut() {
         s.run_stock_progress().await?;
+    }
+
+    // --- Magnetic recipes: gather→success + deadline→failure -----------------
+    // One client drives a despair magnet (gathers a dread → despair_success, magnet
+    // consumed) and a short-window gloom magnet (no candidate → gloom_failure).
+    // Distinct cells in the spawn zone so neither magnet gathers the other's card.
+    if let Some(s) = sessions.first_mut() {
+        s.run_magnetic((4, 4), (5, 4)).await?;
+        s.run_magnetic_failure((1, 1)).await?;
     }
 
     println!("harness: HARNESS PASS (individual, {} client(s))", sessions.len());
@@ -685,12 +695,79 @@ async fn run_combined(sessions: &mut [Session], _humans: &[u32]) -> anyhow::Resu
     }
     println!("harness: ✓ leaf fallback — corpus asking for log's capped top lands on its bottom stack instead");
 
+    // ── Phase 10: PARALLEL magnetic — every client drives a despair (gather→
+    //    despair_success) AND a short-window gloom (no candidate → gloom_failure)
+    //    at the SAME time, so N magnetic players resolve concurrently. ──────────
+    magnetic_parallel_phase(sessions, zone).await?;
+
     for s in sessions.iter_mut() {
         let errors = s.core.drain_errors();
         if !errors.is_empty() {
             bail!("[{}] {} protocol/decode error(s): {errors:?}", s.name, errors.len());
         }
     }
+    Ok(())
+}
+
+/// Drive a magnetic SUCCESS + FAILURE on every client at once. Each client places,
+/// in its own far-apart cells of the shared spawn zone (3,3): a `despair` magnet +
+/// adjacent `dread` (the pass gathers it → `despair_success`, magnet consumed) and
+/// a lone short-window `gloom` (no candidate → `gloom_failure` at the deadline).
+/// `pump_all` drives every client's `magnetic_pass` together, so this exercises
+/// several trusted magnetic players resolving in parallel — the concurrency the
+/// single-client tests can't reach. Cells avoid the souls (2,2)/(4,4) + tree tiles.
+async fn magnetic_parallel_phase(sessions: &mut [Session], zone: u64) -> anyhow::Result<()> {
+    use anyhow::{anyhow, bail, Context};
+    let despair_def = sessions[0].core.packed_def("despair").context("despair def")?;
+    let gloom_def = sessions[0].core.packed_def("gloom").context("gloom def")?;
+    // (despair, dread, gloom) cells per client — all within the 7×7 zone grid
+    // (local 0..6), gloom kept >radius(3) from any dread so it can only fail, each
+    // client's cluster far from the peer's, and clear of souls (2,2)/(4,4) + tree
+    // tiles (3,2)/(6,5).
+    let cells: [((u8, u8), (u8, u8), (u8, u8)); 2] =
+        [((0, 0), (1, 0), (6, 6)), ((0, 6), (1, 6), (6, 0))];
+
+    for (i, s) in sessions.iter_mut().enumerate() {
+        let (dm, dc, gm) = cells[i % 2];
+        s.place_world_card("despair", dm).await?;
+        s.place_world_card("dread", dc).await?;
+        s.place_world_card("gloom", gm).await?;
+    }
+    // Let the creates land on every client, then capture each client's two magnets.
+    pump_all(sessions, Duration::from_secs(2)).await?;
+    let mut magnets: Vec<(u32, u32)> = Vec::new();
+    for (i, s) in sessions.iter().enumerate() {
+        let (dm, _, gm) = cells[i % 2];
+        let despair = s.world_loose_at(despair_def, dm).ok_or_else(|| anyhow!("client {i}: despair magnet not observed"))?;
+        let gloom = s.world_loose_at(gloom_def, gm).ok_or_else(|| anyhow!("client {i}: gloom magnet not observed"))?;
+        magnets.push((despair, gloom));
+    }
+
+    // Drive all passes together until every client's despair (success) AND gloom
+    // (deadline failure) are consumed (~4s gloom window + ~2s actions + gather).
+    let mut done = false;
+    for _ in 0..50 {
+        pump_all(sessions, Duration::from_millis(500)).await?;
+        done = magnets
+            .iter()
+            .enumerate()
+            .all(|(i, &(d, g))| sessions[i].card_dead(d) && sessions[i].card_dead(g));
+        if done {
+            break;
+        }
+    }
+    if !done {
+        let state: Vec<_> = magnets
+            .iter()
+            .enumerate()
+            .map(|(i, &(d, g))| (sessions[i].card_dead(d), sessions[i].card_dead(g)))
+            .collect();
+        bail!("parallel magnetic: not all magnets resolved across {} clients (despair_dead, gloom_dead)={state:?}", sessions.len());
+    }
+    println!(
+        "harness: ✓ parallel magnetic — {} clients each resolved despair (gather success) + gloom (deadline failure) concurrently",
+        sessions.len()
+    );
     Ok(())
 }
 
