@@ -22,7 +22,7 @@ use resonantdust_codec::card_model::{stack_branch, stack_index};
 use resonantdust_dsl::loader::Bundle;
 use resonantdust_protocol::protocol::{ClientCall, ClientMsg, GateMsg, RowOp};
 use resonantdust_dsl::recipe::{build_frame, iterators};
-use resonantdust_state::recipe_state::CardStore;
+use resonantdust_state::recipe_state::{owning_player, CardStore};
 use resonantdust_state::stack::{self, plan_place, StackStore};
 use resonantdust_dsl::vm::match_recipe;
 
@@ -71,11 +71,11 @@ pub enum Command {
     /// Move `soul` ONE tile to the adjacent world cell `(dest_q, dest_r)`. The
     /// client computes the arrival time from the current + destination tile
     /// `cost`s and the soul's `speed` (`travel = (cost_cur+cost_dst)·1000 /
-    /// (2·speed)` ms) and future-stamps the move via `move_soul`: the soul stays
+    /// (2·speed)` ms) and future-stamps the move via `move_card`: the soul stays
     /// at its current cell and "arrives" when the clock reaches `arrival_ms`.
     MoveStep { soul: u32, dest_q: i32, dest_r: i32 },
     /// Walk `soul` to the world cell `(target_q, target_r)`: the client computes a
-    /// hex path and PIPELINES the steps (one future-stamped `move_soul` per tile,
+    /// hex path and PIPELINES the steps (one future-stamped `move_card` per tile,
     /// the next requested as each prior step's row arrives). A no-op if already
     /// there or no path. Re-issuing replaces any in-flight movement (path change).
     MoveTo { soul: u32, target_q: i32, target_r: i32 },
@@ -92,7 +92,7 @@ pub enum Command {
 struct MovePlan {
     /// Cells to visit in order; `path[0]` is adjacent to the start cell.
     path: Vec<(i32, i32)>,
-    /// How many steps have been REQUESTED (`move_soul` sent for `path[0..requested]`).
+    /// How many steps have been REQUESTED (`move_card` sent for `path[0..requested]`).
     requested: usize,
     /// The cell the last-requested step lands on (to match its inbound row).
     last_dest: (i32, i32),
@@ -515,6 +515,32 @@ impl Client {
         self.actions.iter().map(|(r, a)| (*r, a.recipe.clone(), a.submit_cid.is_some())).collect()
     }
 
+    /// The pre-fire debounce window for `root`'s queued action as
+    /// `(total_ms, remaining_ms)`, or `None` when there's no queued action, it's
+    /// already in flight, or it fires immediately (no debounce). Feeds a
+    /// `source = 1` (queue) progress bar; once the action is submitted the bar
+    /// hands off to the server-confirmed completion window (the `source = 0` row
+    /// progress derived from the future-stamped completion). Perf-clock based,
+    /// like the queue's own `ready` gate.
+    pub fn queue_interval(&self, root: u32) -> Option<(u64, u64)> {
+        let a = self.actions.get(&root)?;
+        if a.submit_cid.is_some() || a.delay_ms <= 0.0 {
+            return None;
+        }
+        let elapsed = (self.perf_ms - a.scheduled_at).max(0.0);
+        let remaining = (a.delay_ms - elapsed).max(0.0);
+        Some((a.delay_ms as u64, remaining as u64))
+    }
+
+    /// Whether any action is queued but not yet sent (a live pre-fire debounce).
+    /// The worker re-emits the view while this holds so the queue bar appears and
+    /// advances — queuing is client-side, so it never sets the row-`changed` flag
+    /// the pump otherwise gates re-emits on. Build bars don't need this (the hold
+    /// they set IS a row change); only the pre-send debounce window does.
+    pub fn has_pending_debounce(&self) -> bool {
+        self.actions.values().any(|a| a.submit_cid.is_none() && a.delay_ms > 0.0)
+    }
+
     /// Anchor-aware garbage collection: reap card/zone version rows no soul
     /// remembers — keeping each id's future rows, its current-at-now row, and the
     /// rows pinned by every soul's frozen memory watermark for its zone. The
@@ -651,7 +677,7 @@ impl Client {
                 self.zone_frames()
             }
             Command::MoveStep { soul, dest_q, dest_r } => {
-                self.build_move_soul(soul, dest_q, dest_r).into_iter().collect()
+                self.build_move_card(soul, dest_q, dest_r).into_iter().collect()
             }
             Command::MoveTo { soul, target_q, target_r } => {
                 self.start_move_to(soul, target_q, target_r)
@@ -848,8 +874,12 @@ impl Client {
             return;
         }
 
-        // Role 2: a soul owned by one of our player_souls → anchor + inventory.
-        if self.player_souls.contains(&owner_id) {
+        // Role 2: any card we transitively own → anchor it (world presence) +
+        // ensure its inventory. Generalized off `owning_player` (the same ownership
+        // primitive the placement/gate paths use), so a card owned by a soul — or
+        // by the player_soul directly — is tracked uniformly, not only a card owned
+        // straight by a player_soul.
+        if self.player_id.is_some() && owning_player(self.world(), card_id, now) == self.player_id {
             let Some((q, r)) = hex else { return }; // must be world-placed
             let first_sight = !self.souls.contains_key(&card_id);
             let moved = self.souls.get(&card_id) != Some(&(q, r));
@@ -927,7 +957,11 @@ impl Client {
     /// children, whose `cards` rows re-enter here, so a chest-in-a-chest ensures
     /// down the whole owned tree without an explicit walk.
     fn ensure_owned_inventory(&mut self, card_id: u32) {
-        if self.inventoried.contains(&card_id) || self.owning_soul(card_id).is_none() {
+        let now = self.clock_ms;
+        if self.inventoried.contains(&card_id)
+            || self.player_id.is_none()
+            || owning_player(self.world(), card_id, now) != self.player_id
+        {
             return;
         }
         let Some(packed) = self.world.cards.current(card_id, self.clock_ms).map(|c| c.packed_definition)
@@ -975,6 +1009,15 @@ impl Client {
         direction: u8,
     ) -> Result<Vec<ClientMsg>, String> {
         self.place(card_id, stack::Placement::Stack { parent_id, direction })
+    }
+
+    /// The card ids a loose drag of `card_id` lifts together — the grabbed card plus
+    /// the run a loose `place` would carry (outward run to the first position-held
+    /// card for a member; the whole chain for a root). The (dumb) view copies + dims
+    /// exactly this set on pickup; the same shared resolver carries it on drop, so
+    /// the visual selection always matches the data move. `card_id` is first.
+    pub fn drag_carry_set(&self, card_id: u32) -> Vec<u32> {
+        stack::drag_carry_set(&self.world, card_id, self.clock_ms)
     }
 
     /// Returns `Err` (with reason) if the move is infeasible; an empty frame vec
@@ -1121,13 +1164,13 @@ impl Client {
         self.tile_cost(mz, lq as usize, lr as usize)
     }
 
-    /// Build ONE future-stamped `move_soul` step: `soul` departs `from` at
+    /// Build ONE future-stamped `move_card` step: `soul` departs `from` at
     /// `depart_ms` and arrives at the adjacent cell `dest` at `depart + travel`,
     /// `travel = (cost_from + cost_dest)·1000 / (2·speed)` ms. Returns
     /// `(frame, arrival_ms)`. `None` if the soul/tiles/speed don't resolve (the
     /// cells must be in a loaded/active zone). The single point that emits
-    /// `move_soul`; the single-step and pipelined paths both go through it.
-    fn build_move_soul_step(
+    /// `move_card`; the single-step and pipelined paths both go through it.
+    fn build_move_card_step(
         &mut self,
         soul: u32,
         from: (i32, i32),
@@ -1149,6 +1192,23 @@ impl Client {
         let (dzr, dlr) = zone_local(dest.1);
         let dest_macro = pack_macro_zone_full(0, WORLD_LAYER, dzq, dzr);
         let dest_micro = pack_micro_loose(dlq, dlr, 0, 0);
+        // A card can only step onto a destination tile if it hosts the hex stack
+        // the tile would join — the same rule as loose placement. Souls host hex
+        // by default, so this is a guard: a non-hex mover declines the step rather
+        // than mounting a tile it can't hold. An empty cell imposes no constraint.
+        {
+            let bundle = self.bundle.as_ref();
+            let bits = |p: u16| {
+                bundle
+                    .map(|b| resonantdust_dsl::defs::stack_bits(b, p))
+                    .unwrap_or(resonantdust_codec::stacking::DEFAULT_BITS)
+            };
+            if !resonantdust_state::stack::can_seat_on_tile(
+                &self.world, soul, dest_macro, dlq, dlr, self.clock_ms, &bits,
+            ) {
+                return None;
+            }
+        }
         let caller = self.player_id.unwrap_or(0);
         let cid = self.cid();
         // The gate RE-DERIVES `arrival_ms` from `soul_def`/`from`/`dest`/`depart_ms`
@@ -1158,7 +1218,7 @@ impl Client {
         let frame = ClientMsg::Call {
             cid,
             client_time_ms: self.clock_ms,
-            call: ClientCall::MoveSoul {
+            call: ClientCall::MoveCard {
                 caller_player_id: caller,
                 soul_id: soul,
                 soul_def,
@@ -1176,10 +1236,10 @@ impl Client {
 
     /// A single immediate step from `soul`'s current cell to the adjacent
     /// `(dest_q, dest_r)`, departing now ([`Command::MoveStep`]).
-    fn build_move_soul(&mut self, soul: u32, dest_q: i32, dest_r: i32) -> Option<ClientMsg> {
+    fn build_move_card(&mut self, soul: u32, dest_q: i32, dest_r: i32) -> Option<ClientMsg> {
         let now = self.clock_ms;
         let from = world_hex(self.world.cards.current(soul, now)?)?;
-        self.build_move_soul_step(soul, from, (dest_q, dest_r), now).map(|(f, _)| f)
+        self.build_move_card_step(soul, from, (dest_q, dest_r), now).map(|(f, _)| f)
     }
 
     /// Plan + start a pipelined walk of `soul` to `(target_q, target_r)`: compute a
@@ -1195,7 +1255,7 @@ impl Client {
             self.movements.remove(&soul);
             return Vec::new();
         }
-        match self.build_move_soul_step(soul, start, path[0], now) {
+        match self.build_move_card_step(soul, start, path[0], now) {
             Some((frame, arrival)) => {
                 self.movements.insert(
                     soul,
@@ -1221,7 +1281,7 @@ impl Client {
         if self.world.cards.current(soul, arrival_ms).and_then(world_hex) != Some(from) {
             return;
         }
-        if let Some((frame, new_arrival)) = self.build_move_soul_step(soul, from, next, arrival_ms) {
+        if let Some((frame, new_arrival)) = self.build_move_card_step(soul, from, next, arrival_ms) {
             self.pending_out.push(frame);
             if let Some(p) = self.movements.get_mut(&soul) {
                 p.requested += 1;
@@ -1390,8 +1450,8 @@ impl Client {
     /// First cut: top-level iterators + nested owner-chain (inventory) + the
     /// branch-0 synthetic tile. Candidate-root enumeration over the soul's pool
     /// is the NPC loop's job.
-    pub fn match_recipes(&self, soul: u32, root: u32) -> Vec<RecipeMatch> {
-        self.match_recipes_inner(soul, root, true)
+    pub fn match_recipes(&self, viewer: u32, root: u32) -> Vec<RecipeMatch> {
+        self.match_recipes_inner(viewer, root, true)
     }
 
     /// [`match_recipes`](Self::match_recipes) with the index aspect pre-filter
@@ -1400,8 +1460,8 @@ impl Client {
     /// filtered path; a harness diffs the two to catch an unsound skip. (No-op vs
     /// the filtered path until aspect-guarded recipes exist — `indexed_aspects`
     /// is empty for `def_id eq` recipes.)
-    pub fn match_recipes_unfiltered(&self, soul: u32, root: u32) -> Vec<RecipeMatch> {
-        self.match_recipes_inner(soul, root, false)
+    pub fn match_recipes_unfiltered(&self, viewer: u32, root: u32) -> Vec<RecipeMatch> {
+        self.match_recipes_inner(viewer, root, false)
     }
 
     /// Whether `card_id` is ineligible to be bound into a NEW action. Uses the
@@ -1417,7 +1477,7 @@ impl Client {
             .is_some_and(|c| resonantdust_codec::card_model::bind_blocked(c.flags))
     }
 
-    fn match_recipes_inner(&self, soul: u32, root: u32, use_filter: bool) -> Vec<RecipeMatch> {
+    fn match_recipes_inner(&self, viewer: u32, root: u32, use_filter: bool) -> Vec<RecipeMatch> {
         let Some(bundle) = self.bundle.as_ref() else {
             return Vec::new();
         };
@@ -1433,14 +1493,14 @@ impl Client {
             return Vec::new();
         }
 
-        // The soul's knowledge-time for the root's zone: `now` if it's present
+        // The viewer's knowledge-time for the root's zone: `now` if it's present
         // there (live), else the frozen watermark (memory). Drives the whole
         // match's freshness. Inventory/unknown zones aren't remembered → `now`.
         let view_t = self
             .world
             .cards
             .zone_of(root)
-            .and_then(|z| self.zones.card_view_time(soul, z, now))
+            .and_then(|z| self.zones.card_view_time(viewer, z, now))
             .unwrap_or(now);
         let live = view_t == now;
 
@@ -1467,14 +1527,14 @@ impl Client {
         // `root` param — never a member list), [1] hex/tile, [2] top, [3] bottom.
         let base_branches: [Vec<u32>; 4] = [Vec::new(), branch(1), branch(2), branch(3)];
 
-        // card_id → typed dsl Card, read at the soul's PER-CARD view time (a
+        // card_id → typed dsl Card, read at the viewer's PER-CARD view time (a
         // world card at the root's view_t, an owned inventory item live at `now`).
         let lookup = |id: u32| -> Option<Card> {
             let card_t = self
                 .world
                 .cards
                 .zone_of(id)
-                .and_then(|z| self.zones.card_view_time(soul, z, now))
+                .and_then(|z| self.zones.card_view_time(viewer, z, now))
                 .unwrap_or(now);
             let c = self.world.card_at(id, card_t)?;
             let name = bundle.name_for_packed(c.packed_definition)?;
@@ -1908,7 +1968,9 @@ impl Client {
         // Phase A — read each owned magnet into an owned Plan.
         let mut plans: Vec<Plan> = Vec::new();
         for c in self.world.cards.current_all(now) {
-            if !self.player_souls.contains(&c.owner_id) {
+            // Drive every magnet we transitively own — not only player_soul-owned
+            // ones (`owning_player` is the same ownership test the rest now uses).
+            if owning_player(self.world(), c.card_id, now) != self.player_id {
                 continue;
             }
             let Some(recipe_id) = bundle.magnetic_recipe_id(c.packed_definition) else { continue };
@@ -2057,7 +2119,7 @@ impl Client {
     fn flush_dirty(&mut self) {
         let roots: Vec<u32> = self.dirty_roots.drain().collect();
         for root in roots {
-            match self.actor_soul_for_root(root) {
+            match self.actor_owner_root(root) {
                 Some(soul) => self.evaluate_root(soul, root),
                 None => {
                     if self.actions.get(&root).is_some_and(|a| a.submit_cid.is_none()) {
@@ -2235,43 +2297,31 @@ impl Client {
         })
     }
 
-    /// Walk a card's `owner_id` chain to a soul we control, or `None`. A soul
-    /// owns the cards in its inventory (directly or via nested containers); this
-    /// is how a root in a soul's pocket resolves to its acting soul. Depth-capped.
-    fn owning_soul(&self, card_id: u32) -> Option<u32> {
+    /// The viewer our client matches `root` through — the freshness key for the
+    /// triggered path, resolved by COVERAGE rather than by any "soul" class. Two
+    /// ways a root falls in our reach (mirrors the placement/gate `owning_player`):
+    /// 1. **Ownership coverage** — the root's `owner_id` chain bottoms out at us.
+    ///    We have full roster visibility of our own cards, so we act through our
+    ///    active player_soul and the match is always live — assembling in a pocket,
+    ///    or acting on a card we placed out in the world. This is the case the old
+    ///    `souls`-only walk couldn't resolve (a card owned by the player_soul
+    ///    directly had no acting "soul").
+    /// 2. **Spatial coverage** — a controlled card is present (live) at the root's
+    ///    zone via its anchor: a world recipe on a card we DON'T own (chopping a
+    ///    wild tree). The present card is the viewer; its watermark gates freshness.
+    /// `None` if neither holds. (Coarse pick — Permissions will refine it.)
+    fn actor_owner_root(&self, root: u32) -> Option<u32> {
         let now = self.clock_ms;
-        let mut cur = card_id;
-        for _ in 0..32 {
-            if self.souls.contains_key(&cur) {
-                return Some(cur);
+        // 1. Ownership coverage — always live (our own cards stream via the roster
+        //    regardless of where they sit, so there's no fog-of-war on them).
+        if self.player_id.is_some() && owning_player(self.world(), root, now) == self.player_id {
+            if let Some(ps) = self.player_souls.iter().next().copied() {
+                return Some(ps);
             }
-            let c = self.world.cards.current(cur, now)?;
-            if c.owner_id == 0 || c.owner_id == cur {
-                return None;
-            }
-            cur = c.owner_id;
         }
-        None
-    }
-
-    /// Which of our souls should act on `root` — the actor for the triggered
-    /// path. **Ownership-agnostic** (per the recipe-permission split): a soul acts
-    /// on any valid recipe in its reach, not only on cards it owns. Resolution:
-    /// 1. a soul **present** (live) at the root's zone via its anchor (world
-    ///    recipes — chopping a tree it doesn't own); else
-    /// 2. a soul that **owns** the root through the container chain (inventory
-    ///    recipes — assembling cards in its own pocket).
-    /// `None` if no soul of ours can reach it. (Coarse pick — the NPC loop /
-    /// Permissions will refine which soul + whether it's allowed.)
-    fn actor_soul_for_root(&self, root: u32) -> Option<u32> {
-        let now = self.clock_ms;
+        // 2. Spatial coverage — a controlled card present (live) at the root's zone.
         let zone = self.world.cards.current(root, now)?.macro_zone;
-        if let Some(s) =
-            self.souls.keys().copied().find(|&s| self.zones.card_view_time(s, zone, now) == Some(now))
-        {
-            return Some(s);
-        }
-        self.owning_soul(root)
+        self.souls.keys().copied().find(|&s| self.zones.card_view_time(s, zone, now) == Some(now))
     }
 
     /// Fold a server-time sample into the [`ClockSync`] discipline and refresh
@@ -2713,7 +2763,7 @@ fn hex_path(start: (i32, i32), target: (i32, i32)) -> Vec<(i32, i32)> {
 /// Map a [`stack::Placement`] to the wire `place_card` `placement` arg (the
 /// shard's flat `Placement` struct: snake_case keys; `xy` packs `(x, y)`). Unused
 /// by the commit-based move path (positions sync via `move_cards`); retained for
-/// the genuine-sync placements (equip / `move_soul`) that still use `place_card`.
+/// the genuine-sync placements (equip / `move_card`) that still use `place_card`.
 #[allow(dead_code)]
 fn placement_json(p: &stack::Placement) -> serde_json::Value {
     match *p {
@@ -2818,6 +2868,100 @@ mod tests {
             }
             other => panic!("expected call, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn actor_owner_root_resolves_by_coverage_not_soul_class() {
+        use resonantdust_codec::packed::{pack_macro_zone_full, INVENTORY_LAYER, WORLD_LAYER};
+
+        fn frame(card_id: u32, owner_id: u32, packed_definition: u16, macro_zone: u64) -> GateMsg {
+            GateMsg::Row {
+                sid: 0,
+                op: RowOp::Insert,
+                row: RowData::Card(CardRow {
+                    valid_at: pack_valid_at(100, 1),
+                    card_id,
+                    macro_zone,
+                    micro_location: 0,
+                    owner_id,
+                    packed_definition,
+                    flags: 0,
+                    flags_bk: 0,
+                    stock: 0,
+                }),
+            }
+        }
+
+        let mut c = Client::new();
+        c.player_id = Some(1024);
+        c.clock_ms = 1000;
+
+        // Our player_soul (def 0xFFFF) owned by our player_id — the owner-walk
+        // terminus. Folding the row runs discovery (Role 1 → player_souls).
+        c.apply(frame(2000, 1024, 0xFFFF, 0));
+        assert!(c.player_souls().any(|p| p == 2000), "player_soul discovered");
+
+        // A blueprint we own sitting in the player_soul's INVENTORY (no world hex).
+        // Pre-fix this had NO acting soul — `owning_soul` only matched world
+        // `souls`, so a card owned by the player_soul directly fell through and its
+        // recipe never queued. Ownership coverage now resolves it, always-live.
+        let pocket = pack_macro_zone_full(2000, INVENTORY_LAYER, 0, 0);
+        c.apply(frame(3000, 2000, 0, pocket));
+        assert_eq!(
+            c.actor_owner_root(3000),
+            Some(2000),
+            "a card we own in our own pocket resolves to our player_soul"
+        );
+
+        // A card we own placed out in the WORLD resolves by ownership too (full
+        // roster visibility), independent of any anchor presence.
+        let here = pack_macro_zone_full(0, WORLD_LAYER, 5, 5);
+        c.apply(frame(3001, 2000, 0, here));
+        assert_eq!(
+            c.actor_owner_root(3001),
+            Some(2000),
+            "a card we own in the world resolves by ownership"
+        );
+
+        // A wild card we don't own, in a zone where no actor of ours is present →
+        // no coverage (fog-of-war preserved: you can't act on what you can't see).
+        let elsewhere = pack_macro_zone_full(0, WORLD_LAYER, 20, 20);
+        c.apply(frame(4000, 0, 0, elsewhere));
+        assert_eq!(
+            c.actor_owner_root(4000),
+            None,
+            "an unowned card with no actor present is skipped"
+        );
+    }
+
+    #[test]
+    fn queue_interval_reports_the_debounce_window() {
+        use crate::actions::QueuedAction;
+        let mut c = Client::new();
+        c.perf_ms = 1000.0;
+        c.actions.insert(
+            50,
+            QueuedAction {
+                soul: 1,
+                recipe: "r".into(),
+                root: 50,
+                bindings: vec![],
+                surface: 0,
+                macro_zone: 0,
+                micro_location: 0,
+                scheduled_at: 600.0,
+                delay_ms: 5000.0,
+                retry_count: 0,
+                submit_cid: None,
+            },
+        );
+        // 400ms elapsed of a 5000ms debounce → 4600ms remaining.
+        assert_eq!(c.queue_interval(50), Some((5000, 4600)));
+        // Once submitted (in flight) the pre-fire bar yields to the build window.
+        c.actions.get_mut(&50).unwrap().submit_cid = Some(7);
+        assert_eq!(c.queue_interval(50), None);
+        // No queued action on this root → no window.
+        assert_eq!(c.queue_interval(999), None);
     }
 
     #[test]

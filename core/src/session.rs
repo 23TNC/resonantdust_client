@@ -293,7 +293,7 @@ impl Session {
         let tally = find_loose(&self.core, tally_def).unwrap();
         let progress = |c: &Client| -> u32 {
             let now = c.clock_ms();
-            c.world().cards.current(tally, now).map(|r| r.stock & 0xFF).unwrap_or(0)
+            c.world().cards.current(tally, now).map(|r| (r.stock & 0xFF) as u32).unwrap_or(0)
         };
 
         // STAGE 3: the freshly-spawned tally must carry its `@define` stock
@@ -373,7 +373,7 @@ impl Session {
         let widget_progress = |c: &Client| -> Option<(u32, u32)> {
             let now = c.clock_ms();
             find_owned_loose(c, widget_def, me)
-                .and_then(|id| c.world().cards.current(id, now).map(|r| (id, r.stock & 0xFF)))
+                .and_then(|id| c.world().cards.current(id, now).map(|r| (id, (r.stock & 0xFF) as u32)))
         };
         let mut found = None;
         for _ in 0..30 {

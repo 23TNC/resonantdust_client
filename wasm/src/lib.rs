@@ -323,20 +323,48 @@ impl WasmClient {
     }
 
     /// Drop a card loose at a GLOBAL world cell `(q, r)` on `(surface, owner)` —
-    /// the view's drag-drop path. One-way: on success the new position arrives via
-    /// the render stream; on rejection the data is unchanged, so the card simply
-    /// tweens back to its origin (no ack, no prediction).
-    pub fn place_loose(&mut self, card_id: u32, surface: u8, owner: u32, q: i32, r: i32) {
-        if let Ok(frames) = self.core.place_loose(card_id, surface, owner, q, r) {
-            self.send(&frames);
+    /// the view's drag-drop path. `place` applies the move to the LOCAL world
+    /// immediately (the prediction) and only puts a `move_cards` on the wire when
+    /// the zone is shared/anchored; a private inventory move stays client-local.
+    /// Either way the local world changed, so flag `changed` to re-emit the view —
+    /// without it the renderer keeps the stale (pre-drop) cell as its tween target
+    /// and the card glides back to its origin as if the move were rejected, only
+    /// snapping to the dropped cell on the next pan (a fresh `emitView`).
+    /// Returns whether the card actually moved — `true` on a resolved move (the
+    /// view awaits this before releasing the drag ghost, so it doesn't tween the
+    /// card back to origin before the prediction lands), `false` if the resolver
+    /// rejected it (the card stays put → the ghost snaps back).
+    pub fn place_loose(&mut self, card_id: u32, surface: u8, owner: u32, q: i32, r: i32) -> bool {
+        match self.core.place_loose(card_id, surface, owner, q, r) {
+            Ok(frames) => {
+                self.send(&frames);
+                self.changed = true;
+                true
+            }
+            Err(_) => false,
         }
     }
 
     /// Drop a card onto `parent_id`'s stack in `direction` (drop-on-a-card).
-    pub fn place_stack(&mut self, card_id: u32, parent_id: u32, direction: u8) {
-        if let Ok(frames) = self.core.place_stack(card_id, parent_id, direction) {
-            self.send(&frames);
+    /// Flags `changed` for the same reason as [`Self::place_loose`]; returns whether
+    /// the card moved (see [`Self::place_loose`]).
+    pub fn place_stack(&mut self, card_id: u32, parent_id: u32, direction: u8) -> bool {
+        match self.core.place_stack(card_id, parent_id, direction) {
+            Ok(frames) => {
+                self.send(&frames);
+                self.changed = true;
+                true
+            }
+            Err(_) => false,
         }
+    }
+
+    /// The card ids a loose drag of `card_id` lifts together (grabbed card first,
+    /// then the run a loose drop carries — outward run to the first position-held
+    /// card for a member, the whole chain for a root). The view copies + dims this
+    /// exact set on pickup; the same resolver carries it on drop. Read-only.
+    pub fn carried_run(&self, card_id: u32) -> Vec<u32> {
+        self.core.drag_carry_set(card_id)
     }
 
     /// Create a new card via `create_card` — the chat `/give` path. `owner` owns
@@ -576,6 +604,13 @@ impl WasmClient {
         self.subs.to_json()
     }
 
+    /// Whether a pre-fire action debounce is live — the worker re-emits the view
+    /// while this holds so the queue progress bar appears/advances (queuing is
+    /// client-side and never trips the row-`changed` re-emit gate).
+    pub fn has_pending_debounce(&self) -> bool {
+        self.core.has_pending_debounce()
+    }
+
     /// The renderables in a region of `surface` centred on hex `(center_q,
     /// center_r)`, as a JSON `Renderable[]` (the view's render-feed shape):
     /// the zone tile grid first (under everything), then cards. Loose cards sit
@@ -661,6 +696,22 @@ impl WasmClient {
             if (q - center_q).abs() > half_cols + 1 || (r - center_r).abs() > half_rows + 1 {
                 continue;
             }
+            // Progress-bar timing, as `(total, remaining)` ms so the view fills
+            // locally with its own clock — no per-frame worker round-trip.
+            // `source = 0` (build): an in-flight action HOLDS this card and
+            // future-stamps a completion row → fill from the current row (start)
+            // toward that future row (completion). `source = 1` (queue): the
+            // pre-fire debounce window. Zero total → the bar self-hides (view reads
+            // `< 0`).
+            let (p_total, p_remaining) = if resonantdust_codec::card_model::has_active_holds(row.flags) {
+                match world.cards.next_future_ms(row.card_id, now) {
+                    Some(end) if end > row.time_ms() => (end - row.time_ms(), end.saturating_sub(now)),
+                    _ => (0u64, 0u64),
+                }
+            } else {
+                (0, 0)
+            };
+            let (q_total, q_remaining) = self.core.queue_interval(row.card_id).unwrap_or((0, 0));
             out.push(serde_json::json!({
                 "layer": "card",
                 "cardId": row.card_id,
@@ -670,8 +721,15 @@ impl WasmClient {
                 "offsetX": 0,
                 "offsetY": 0,
                 "packed": row.packed_definition,
-                "stock": row.stock,
+                // `stock` is a u64 — serialize as a string so JSON.parse in the
+                // view never rounds it through a 53-bit JS number (same reason
+                // `sentAt` is a string). The view keeps it opaque / BigInts it.
+                "stock": row.stock.to_string(),
                 "flags": row.flags,
+                "pTotalMs": p_total,
+                "pRemainingMs": p_remaining,
+                "qTotalMs": q_total,
+                "qRemainingMs": q_remaining,
             }));
         }
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())

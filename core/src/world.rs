@@ -110,6 +110,15 @@ impl Cards {
         self.by_id.values().filter_map(move |hist| current_of(hist, now_ms))
     }
 
+    /// The earliest FUTURE-stamped version time for `card_id` — the smallest
+    /// `time_ms` strictly after `now_ms`, or `None`. Bracketed with the current
+    /// row's time, this is an in-flight action's `[start, completion]` window, the
+    /// source the client fills a progress bar from.
+    pub fn next_future_ms(&self, card_id: u32, now_ms: u64) -> Option<u64> {
+        let hist = self.by_id.get(&card_id)?;
+        hist.values().map(|r| r.time_ms()).filter(|&t| t > now_ms).min()
+    }
+
     /// Anchor-aware GC: per card, keep its live + remembered rows, reap the rest.
     /// `pins_for_zone(zone)` gives the frozen card watermarks pinning that zone
     /// (from the zone manager). A card's zone is its current (else latest) row's
@@ -256,6 +265,36 @@ impl resonantdust_state::stack::StackStore for World {
             .map(card_view)
             .collect()
     }
+
+    // The synthetic tile at a cell, read from the zone's packed grid — the virtual
+    // hex member a card seated here would mount (mirrors `synthetic_tile`). A
+    // materialized tile-card row is a real card the drag controller routes to
+    // `place_stack`, so `place_loose` only ever asks about empty cells → the zone
+    // slot is the authority. `None` when the cell is empty (def 0) or unloaded.
+    fn tile_at(
+        &self,
+        macro_zone: u64,
+        q: u8,
+        r: u8,
+        now_ms: u64,
+    ) -> Option<resonantdust_state::recipe_state::CardView> {
+        use resonantdust_codec::packed::{pack_definition, tile_def_id, tile_slot};
+        let zone = self.zones.current(macro_zone, now_ms)?;
+        let words = zone.tile_words();
+        let def_id = tile_def_id(&words, tile_slot(q, r));
+        if def_id == 0 {
+            return None;
+        }
+        Some(resonantdust_state::recipe_state::CardView {
+            card_id: 0,
+            owner_id: 0,
+            micro_location: 0,
+            macro_zone,
+            packed_definition: pack_definition(zone.tile_card_type(), def_id),
+            flags: 0,
+            stock: 0,
+        })
+    }
 }
 
 /// View a stored row as the shared model's `CardView`.
@@ -313,6 +352,22 @@ mod tests {
         assert_eq!(cards.version_count(), 4);
         cards.gc(250, |_zone| vec![150]); // current-as-of-150 = t=100 → retained
         assert_eq!(cards.version_count(), 4, "pinned old version retained as memory");
+    }
+
+    #[test]
+    fn next_future_ms_brackets_the_completion_window() {
+        let mut cards = Cards::default();
+        // current row at 100, a future completion finalize stamped at 400.
+        cards.apply(RowOp::Insert, loose_row(1024, 100, 7));
+        cards.apply(RowOp::Insert, loose_row(1024, 400, 7));
+        // at now=250: the start is the current row (100), the end is the next
+        // future row (400) → a 300ms window with 150ms left.
+        assert_eq!(cards.next_future_ms(1024, 250), Some(400));
+        assert_eq!(cards.current(1024, 250).unwrap().time_ms(), 100);
+        // no future row → no window.
+        assert_eq!(cards.next_future_ms(1024, 500), None);
+        // unknown card → None.
+        assert_eq!(cards.next_future_ms(9999, 250), None);
     }
 
     #[test]
