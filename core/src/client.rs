@@ -1474,7 +1474,7 @@ impl Client {
         self.world
             .cards
             .current(card_id, now_ms)
-            .is_some_and(|c| resonantdust_codec::card_model::bind_blocked(c.flags))
+            .is_some_and(|c| resonantdust_codec::card_model::bind_blocked(c.flags, c.stock))
     }
 
     fn match_recipes_inner(&self, viewer: u32, root: u32, use_filter: bool) -> Vec<RecipeMatch> {
