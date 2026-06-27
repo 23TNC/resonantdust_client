@@ -947,7 +947,7 @@ impl Client {
         use resonantdust_dsl::bridge::{card_view, Card};
         use resonantdust_dsl::vm::{Cell, Store};
         let bundle = self.bundle.as_ref()?;
-        let store = Store::with_root(card_view(bundle, &Card { def_id, stock: Vec::new() }));
+        let store = Store::with_root(card_view(bundle, &Card { def_id, stock: Vec::new(), stock_raw: 0 }));
         store.read(&format!("aspect.{aspect}")).map(Cell::as_int)
     }
 
@@ -1542,7 +1542,7 @@ impl Client {
             // the recipe reads this card's actual stock aspects (build progress,
             // etc.), not just the def defaults.
             let stock = resonantdust_dsl::bridge::stock_to_vec(bundle, name, c.stock);
-            Some(Card { def_id: bundle.card_def_id(name)?, stock })
+            Some(Card { def_id: bundle.card_def_id(name)?, stock, stock_raw: c.stock })
         };
 
         // Synthetic hex tile: the tile under the root (stack 1), as the soul
@@ -1755,6 +1755,7 @@ impl Client {
         Some(Card {
             def_id: bundle.card_def_id(name)?,
             stock: vec![tile_stock(&words, idx, 0) as i64, tile_stock(&words, idx, 1) as i64],
+            stock_raw: 0,
         })
     }
 
