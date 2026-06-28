@@ -967,7 +967,7 @@ async fn run_jim_lock_test(
     );
 
     // ── J3: position-lock + the axe1-move drag-carry anchored by the locked dust ─
-    use resonantdust_codec::card_model::{hold_count, HoldField};
+    use resonantdust_codec::aspects::{count, StockAspect};
 
     // J3a: corpus_dust self-advances — dust stays in the top stack, so it re-queues
     //   and produces another food.
@@ -991,8 +991,8 @@ async fn run_jim_lock_test(
     for _ in 0..80 {
         pump_all(sessions, Duration::from_millis(250)).await?;
         let n = sessions[jim].core.clock_ms();
-        let df = sessions[jim].core.world().cards.current(dust, n).map(|x| x.flags).unwrap_or(0);
-        if hold_count(df, HoldField::PositionHold) > 0 {
+        let df = sessions[jim].core.world().cards.current(dust, n).map(|x| x.stock).unwrap_or(0);
+        if count(df, StockAspect::PosHold) > 0 {
             running = true;
             break;
         }
@@ -1001,12 +1001,12 @@ async fn run_jim_lock_test(
         bail!("J3b: never caught corpus_dust holding dust");
     }
     let n = sessions[jim].core.clock_ms();
-    let af = sessions[jim].core.world().cards.current(a, n).map(|x| x.flags).unwrap_or(0);
-    if hold_count(af, HoldField::PositionHold) != 0 {
-        bail!("J3b: corpus1 must NOT be position-locked (it is `use`d); flags={af:#x}");
+    let af = sessions[jim].core.world().cards.current(a, n).map(|x| x.stock).unwrap_or(0);
+    if count(af, StockAspect::PosHold) != 0 {
+        bail!("J3b: corpus1 must NOT be position-locked (it is `use`d); stock={af:#x}");
     }
-    if hold_count(af, HoldField::SlotClaim) == 0 {
-        bail!("J3b: corpus1 must be slot-held (used) by corpus_dust; flags={af:#x}");
+    if count(af, StockAspect::Claim) == 0 {
+        bail!("J3b: corpus1 must be slot-held (used) by corpus_dust; stock={af:#x}");
     }
     println!("harness: ✓ J3 holds — dust position-locked (claim), corpus1 used not position-locked");
 
@@ -1077,8 +1077,8 @@ async fn run_jim_lock_test(
     let mut moved = false;
     for _ in 0..60 {
         let n = sessions[jim].core.clock_ms();
-        let df = sessions[jim].core.world().cards.current(dust, n).map(|x| x.flags).unwrap_or(0);
-        if hold_count(df, HoldField::PositionHold) == 0
+        let df = sessions[jim].core.world().cards.current(dust, n).map(|x| x.stock).unwrap_or(0);
+        if count(df, StockAspect::PosHold) == 0
             && sessions[jim]
                 .core
                 .place(dust, Placement::Loose { surface: INVENTORY_LAYER, macro_zone: inv, q: 0, r: 0, x: 0, y: 0 })
