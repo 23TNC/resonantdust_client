@@ -703,7 +703,7 @@ impl WasmClient {
             // toward that future row (completion). `source = 1` (queue): the
             // pre-fire debounce window. Zero total → the bar self-hides (view reads
             // `< 0`).
-            let (p_total, p_remaining) = if resonantdust_codec::card_model::has_active_holds(row.flags) {
+            let (p_total, p_remaining) = if resonantdust_codec::aspects::has_active_holds(row.stock) {
                 match world.cards.next_future_ms(row.card_id, now) {
                     Some(end) if end > row.time_ms() => (end - row.time_ms(), end.saturating_sub(now)),
                     _ => (0u64, 0u64),
