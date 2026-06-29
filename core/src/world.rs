@@ -11,7 +11,7 @@
 //! Transport-agnostic and renderer-free: [`World::ingest`] takes parsed
 //! [`GateMsg`]s, so the whole path is exercised in tests with zero network.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use resonantdust_protocol::protocol::RowOp;
 
@@ -104,19 +104,110 @@ impl Cards {
         }
     }
 
+    /// Re-derive the `stock` of this card's LOCAL position rows (the `valid_at`s in
+    /// `local`) from the authoritative server rows: each local row adopts the
+    /// `stock` of the nearest server row at-or-before its own `time_ms`. The dual of
+    /// [`pin_position`](Self::pin_position) — a local move overrides POSITION, but
+    /// `stock` (holds — the op-log mirror) stays server truth. Without this, a local
+    /// move row freezes a stale `stock` and shadows an in-flight hold that lands at
+    /// an EARLIER stamp (the hold acquire is stamped at the recipe start), so
+    /// `is_held` reads `claim=0` and the matcher re-queues the running recipe. A
+    /// local row with no server row before it keeps its own `stock` (nothing to
+    /// derive from).
+    pub fn resync_local_stock(&mut self, card_id: u32, local: &BTreeSet<u64>) {
+        let Some(hist) = self.by_id.get_mut(&card_id) else { return };
+        // Server rows' (time_ms, stock) — every row NOT authored locally.
+        let server: Vec<(u64, u64)> = hist
+            .iter()
+            .filter(|(vat, _)| !local.contains(vat))
+            .map(|(_, r)| (r.time_ms(), r.stock))
+            .collect();
+        if server.is_empty() {
+            return;
+        }
+        for (vat, row) in hist.iter_mut() {
+            if !local.contains(vat) {
+                continue;
+            }
+            let t = row.time_ms();
+            if let Some((_, stock)) =
+                server.iter().filter(|(st, _)| *st <= t).max_by_key(|(st, _)| *st)
+            {
+                row.stock = *stock;
+            }
+        }
+    }
+
     /// Every card's current-at-`now_ms` row (skipping cards that are entirely
     /// future-stamped). Order follows `card_id`.
     pub fn current_all(&self, now_ms: u64) -> impl Iterator<Item = &CardRow> {
         self.by_id.values().filter_map(move |hist| current_of(hist, now_ms))
     }
 
-    /// The earliest FUTURE-stamped version time for `card_id` — the smallest
-    /// `time_ms` strictly after `now_ms`, or `None`. Bracketed with the current
-    /// row's time, this is an in-flight action's `[start, completion]` window, the
-    /// source the client fills a progress bar from.
-    pub fn next_future_ms(&self, card_id: u32, now_ms: u64) -> Option<u64> {
+    /// The card's earliest FUTURE-stamped row — the one with the smallest
+    /// `time_ms` strictly after `now_ms`, or `None`. (No longer drives the build
+    /// bar — that's [`progress_window`](Self::progress_window) — but kept as a
+    /// generic "next promotion" primitive.)
+    pub fn next_future_row(&self, card_id: u32, now_ms: u64) -> Option<&CardRow> {
         let hist = self.by_id.get(&card_id)?;
-        hist.values().map(|r| r.time_ms()).filter(|&t| t > now_ms).min()
+        hist.values().filter(|r| r.time_ms() > now_ms).min_by_key(|r| r.time_ms())
+    }
+
+    /// The `[start, end]` ms window of the first progress run that hasn't finished
+    /// by `now_ms`, or `None`. `is_active` tests a row for the progress bit (the
+    /// caller decodes `pstatus` against the def schema, which this store can't).
+    ///
+    /// A "run" is a maximal stretch of consecutive `is_active` rows; the recipe
+    /// sets the bit at hold-acquire and clears it at completion, so the run's first
+    /// row is the bar's START and the clearing row is its END. We return the first
+    /// run whose END is still in the future, which uniformly covers:
+    ///   - run straddling now (`start ≤ now < end`) → the live bar;
+    ///   - run entirely ahead (`now < start`) → an upcoming bar the caller draws
+    ///     empty (clamped) until the clock reaches it;
+    /// and skips runs already finished (`end ≤ now`). A run that never closes
+    /// (missing `end_bar`, or the completion row not yet streamed) falls back to
+    /// the latest known row as END — degenerate (`total == 0` ⇒ caller hides it),
+    /// which is the visible symptom of a recipe that set the bit without clearing.
+    pub fn progress_window(
+        &self,
+        card_id: u32,
+        now_ms: u64,
+        is_active: impl Fn(&CardRow) -> bool,
+    ) -> Option<(u64, u64)> {
+        let hist = self.by_id.get(&card_id)?;
+        // Iterates time-ascending (`valid_at` = `time_ms << 16 | seq`).
+        let mut run_start: Option<u64> = None;
+        for r in hist.values() {
+            let t = r.time_ms();
+            match (run_start, is_active(r)) {
+                (None, true) => run_start = Some(t), // run opens
+                (Some(s), false) => {
+                    // Run closes here. First one still open at `now` wins.
+                    if t > now_ms {
+                        return Some((s, t));
+                    }
+                    run_start = None; // already finished — keep scanning
+                }
+                _ => {} // continuing a run / still idle
+            }
+        }
+        // Open-ended tail run (no clearing row): end = latest known row.
+        let s = run_start?;
+        let last = hist.values().next_back()?.time_ms();
+        (last > now_ms).then_some((s, last))
+    }
+
+    /// The earliest future-stamped `time_ms` across ALL cards, or `None` if every
+    /// row is already current. Mirrors [`Zones::min_future_time`] — a future tile-card
+    /// row (a `cut_tree` completion's decrement) fires no event when the clock crosses
+    /// it, so the core watches this to kick a re-render/re-match then.
+    pub fn min_future_time(&self, now_ms: u64) -> Option<u64> {
+        self.by_id
+            .values()
+            .flat_map(|hist| hist.values())
+            .map(|r| r.time_ms())
+            .filter(|t| *t > now_ms)
+            .min()
     }
 
     /// Anchor-aware GC: per card, keep its live + remembered rows, reap the rest.
@@ -243,6 +334,34 @@ impl Zones {
 pub struct World {
     pub cards: Cards,
     pub zones: Zones,
+    /// Promoted tile-cards (regions-DB `cards`, surfaced by the gate as the
+    /// `tile_cards` table), kept apart from `cards` so they never leak into
+    /// player-card enumeration / rendering. They carry the live per-cell stock
+    /// (a `cut_tree`'s decrement, an in-flight hold) that the bare zone slot only
+    /// catches up to on GC demotion — read with card-priority via [`Self::tile_card_at`].
+    pub tile_cards: Cards,
+}
+
+impl World {
+    /// A promoted tile-card's `(packed_definition, stock0, stock1)` current at
+    /// `now_ms` for the loose cell `(q, r)` of `macro_zone`, or `None` if none is
+    /// promoted there. Feeds the shared [`resonantdust_codec::packed::synthetic_tile`]
+    /// card-priority rule (mirrors the gate's `latest_tile_card_at`), but
+    /// time-aware: a future-stamped completion row stays hidden until its time.
+    pub fn tile_card_at(&self, macro_zone: u64, q: u8, r: u8, now_ms: u64) -> Option<(u16, u8, u8)> {
+        use resonantdust_codec::card_model::{micro_is_card, stock, Micro};
+        self.tile_cards
+            .current_all(now_ms)
+            .find(|c| {
+                c.macro_zone == macro_zone
+                    && !micro_is_card(c.flags)
+                    && matches!(
+                        Micro::of(c.micro_location, c.flags),
+                        Micro::Loose { local_q, local_r, .. } if local_q == q && local_r == r
+                    )
+            })
+            .map(|c| (c.packed_definition, stock(c.stock, 0), stock(c.stock, 1)))
+    }
 }
 
 // The world is a `StackStore` so the shared `stack::plan_place` runs against it
@@ -266,11 +385,10 @@ impl resonantdust_state::stack::StackStore for World {
             .collect()
     }
 
-    // The synthetic tile at a cell, read from the zone's packed grid — the virtual
-    // hex member a card seated here would mount (mirrors `synthetic_tile`). A
-    // materialized tile-card row is a real card the drag controller routes to
-    // `place_stack`, so `place_loose` only ever asks about empty cells → the zone
-    // slot is the authority. `None` when the cell is empty (def 0) or unloaded.
+    // The synthetic tile at a cell — the virtual hex member a card seated here
+    // would mount. Card-priority via the shared rule: a promoted tile-card's live
+    // view wins over the zone's packed grid slot, exactly as the gate matcher does,
+    // so the client can't drift. `None` when the cell is empty (def 0) or unloaded.
     fn tile_at(
         &self,
         macro_zone: u64,
@@ -278,22 +396,32 @@ impl resonantdust_state::stack::StackStore for World {
         r: u8,
         now_ms: u64,
     ) -> Option<resonantdust_state::recipe_state::CardView> {
-        use resonantdust_codec::packed::{pack_definition, tile_def_id, tile_slot};
+        use resonantdust_codec::card_model::write_stock;
         let zone = self.zones.current(macro_zone, now_ms)?;
-        let words = zone.tile_words();
-        let def_id = tile_def_id(&words, tile_slot(q, r));
-        if def_id == 0 {
-            return None;
-        }
+        let (packed_definition, s0, s1) = resonantdust_codec::packed::synthetic_tile(
+            self.tile_card_at(macro_zone, q, r, now_ms),
+            &zone.tile_words(),
+            zone.tile_card_type(),
+            q,
+            r,
+        )?;
         Some(resonantdust_state::recipe_state::CardView {
             card_id: 0,
             owner_id: 0,
             micro_location: 0,
             macro_zone,
-            packed_definition: pack_definition(zone.tile_card_type(), def_id),
+            packed_definition,
             flags: 0,
-            stock: 0,
+            stock: write_stock(write_stock(0, 0, s0), 1, s1),
         })
+    }
+
+    // The client tracks terrain (zone tile grids + promoted tile-cards), so a `None`
+    // from `tile_at` is authoritative: the cell is genuinely un-tiled. This is what
+    // makes a loose drop onto a non-existent tile reject (the player can't place past
+    // the map / inventory disk) — the shard/gate stay tile-blind and trust the move.
+    fn tracks_tiles(&self) -> bool {
+        true
     }
 }
 
@@ -355,19 +483,69 @@ mod tests {
     }
 
     #[test]
-    fn next_future_ms_brackets_the_completion_window() {
+    fn next_future_row_brackets_the_completion_window() {
         let mut cards = Cards::default();
         // current row at 100, a future completion finalize stamped at 400.
         cards.apply(RowOp::Insert, loose_row(1024, 100, 7));
         cards.apply(RowOp::Insert, loose_row(1024, 400, 7));
         // at now=250: the start is the current row (100), the end is the next
         // future row (400) → a 300ms window with 150ms left.
-        assert_eq!(cards.next_future_ms(1024, 250), Some(400));
+        assert_eq!(cards.next_future_row(1024, 250).map(|r| r.time_ms()), Some(400));
         assert_eq!(cards.current(1024, 250).unwrap().time_ms(), 100);
         // no future row → no window.
-        assert_eq!(cards.next_future_ms(1024, 500), None);
+        assert!(cards.next_future_row(1024, 500).is_none());
         // unknown card → None.
-        assert_eq!(cards.next_future_ms(9999, 250), None);
+        assert!(cards.next_future_row(9999, 250).is_none());
+    }
+
+    // Build a row whose `pstatus` channel-0 bit (stock bit 0) is on/off — the test
+    // stand-in for `start_bar`/`end_bar` writes, decoded here as `stock & 1`.
+    fn bar_row(t: u64, on: bool) -> CardRow {
+        let mut r = loose_row(1024, t, 7);
+        r.stock = on as u64;
+        r
+    }
+    const BAR_ON: fn(&CardRow) -> bool = |r| r.stock & 1 != 0;
+
+    #[test]
+    fn progress_window_scans_the_bit_interval() {
+        let mut cards = Cards::default();
+        // bit set at hold-acquire (100), cleared at completion (400).
+        cards.apply(RowOp::Insert, bar_row(100, true));
+        cards.apply(RowOp::Insert, bar_row(400, false));
+        // live: now inside [100,400) → the full window.
+        assert_eq!(cards.progress_window(1024, 250, BAR_ON), Some((100, 400)));
+        // upcoming: now before start → still [100,400] (caller draws it empty).
+        assert_eq!(cards.progress_window(1024, 50, BAR_ON), Some((100, 400)));
+        // finished: now at/after the clear → no window.
+        assert_eq!(cards.progress_window(1024, 400, BAR_ON), None);
+        assert_eq!(cards.progress_window(1024, 500, BAR_ON), None);
+        // unknown card → None.
+        assert_eq!(cards.progress_window(9999, 250, BAR_ON), None);
+    }
+
+    #[test]
+    fn progress_window_skips_finished_runs() {
+        let mut cards = Cards::default();
+        // run [100,200] finishes; a second run opens at 300, clears at 600.
+        for (t, on) in [(100, true), (200, false), (300, true), (600, false)] {
+            cards.apply(RowOp::Insert, bar_row(t, on));
+        }
+        // now=400: first run already done (end 200) → the live one is [300,600].
+        assert_eq!(cards.progress_window(1024, 400, BAR_ON), Some((300, 600)));
+        // now=250: first run finished, second still upcoming.
+        assert_eq!(cards.progress_window(1024, 250, BAR_ON), Some((300, 600)));
+    }
+
+    #[test]
+    fn progress_window_open_run_falls_back_to_last_row() {
+        // Missing `end_bar`: the bit never clears, so END falls back to the latest
+        // known row — a degenerate bar that never completes once that row is past.
+        let mut cards = Cards::default();
+        cards.apply(RowOp::Insert, bar_row(100, true));
+        cards.apply(RowOp::Insert, bar_row(400, true));
+        assert_eq!(cards.progress_window(1024, 250, BAR_ON), Some((100, 400)));
+        assert_eq!(cards.progress_window(1024, 400, BAR_ON), None);
     }
 
     #[test]

@@ -15,7 +15,7 @@
 //! shuttles frames to/from the socket is per-target. The core is exhaustively
 //! testable by feeding frames — no transport needed.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use resonantdust_dsl::bridge::Card;
 use resonantdust_codec::card_model::{stack_branch, stack_index};
@@ -27,7 +27,8 @@ use resonantdust_state::stack::{self, plan_place, StackStore};
 use resonantdust_dsl::vm::match_recipe;
 
 use crate::actions::{
-    QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, TIME_DRIFT_RETRY_PAD_MS,
+    QueuedAction, DEFAULT_DELAY_MS, MAX_TIME_DRIFT_RETRIES, SETTLE_GRACE_MS,
+    TIME_DRIFT_RETRY_PAD_MS,
 };
 use crate::clock::ClockSync;
 use crate::rows::{CardRow, RowData};
@@ -234,6 +235,10 @@ pub struct Client {
     /// Live scoped subscription sid per `(macro_zone, data type)` — so a sub can
     /// be `Unsub`'d by its sid when the zone manager closes it.
     zone_subs: HashMap<(u64, DataType), u32>,
+    /// Live promoted-tile-card subscription sid per `macro_zone`, opened in lockstep
+    /// with that zone's `Card` sub (the gate's `tile_cards` table). Tracked apart so
+    /// it tears down with the Card sub by its own sid.
+    tile_card_subs: HashMap<u64, u32>,
     /// Live region subscription sid per `macro_region`.
     region_subs: HashMap<u64, u32>,
     /// Outbound frames queued while folding inbound rows (the soul-discovery
@@ -311,6 +316,15 @@ pub struct Client {
     /// is flushed via the `move_cards` batch reducer before a recipe proposal (and
     /// later on an observer 1→>1 transition). Cleared on flush.
     dirty_positions: HashSet<u32>,
+    /// `card_id` → the `valid_at`s of the rows this client authored LOCALLY for a
+    /// pending move (the `dirty_positions` rows). A local move overrides POSITION
+    /// only; `stock` (holds — the op-log mirror) stays server truth. These rows are
+    /// re-derived (`Cards::resync_local_stock`) whenever a server row lands, so an
+    /// in-flight hold arriving at an EARLIER stamp is never shadowed by a later
+    /// local row (which would make `is_held` read stale `claim=0` and re-queue the
+    /// running recipe). The stock dual of `pin_position`'s position pin. Cleared
+    /// with `dirty_positions`.
+    local_rows: HashMap<u32, BTreeSet<u64>>,
     /// Monotonic u16 for stamping LOCAL position rows' `valid_at` seq — keeps
     /// same-ms local moves distinct in the bitemporal store. Server rows use the
     /// shard's global sequence; this is purely client-local.
@@ -405,6 +419,7 @@ impl Default for Client {
             bundle: None,
             zones: ZoneManager::new(),
             zone_subs: HashMap::new(),
+            tile_card_subs: HashMap::new(),
             region_subs: HashMap::new(),
             pending_out: Vec::new(),
             actions: HashMap::new(),
@@ -425,6 +440,7 @@ impl Default for Client {
             seen_errors: Vec::new(),
             action_outcomes: Vec::new(),
             dirty_positions: HashSet::new(),
+            local_rows: HashMap::new(),
             local_seq: 0,
             pending_promotions: Vec::new(),
             next_zone_promote: None,
@@ -468,6 +484,31 @@ impl Client {
     /// drivers/tests that scan the world by card kind.
     pub fn packed_def(&self, name: &str) -> Option<u16> {
         self.bundle.as_ref().and_then(|b| b.packed_def(name))
+    }
+
+    /// The build bar's `(start_ms, end_ms, channel)` for `card_id` — ABSOLUTE
+    /// server-time bounds — or `None` when no bar is active or upcoming. Decodes the
+    /// `pstatus` presence bitmap from the def schema and scans the card's row history
+    /// for the bit's interval (set at hold-acquire, cleared at completion) via
+    /// [`Cards::progress_window`](crate::world::Cards::progress_window) — so the
+    /// window is deterministic (a stable `[start, end]`) rather than the fragile
+    /// single-future-row peek. Absolute bounds (not a `remaining` countdown) let the
+    /// view fill against the disciplined server clock — the same clock the row
+    /// promotions use — so the bar reaches full exactly as the completion promotes,
+    /// and an upcoming bar (`now < start`) simply reads as fraction ≤ 0. `channel`
+    /// is the active bit index (the view maps it to a fill style via
+    /// `visual.pstyle.N`, defaulting ltr). Only channel 0 is used today.
+    pub fn progress_window(&self, card_id: u32, packed: u16, now_ms: u64) -> Option<(u64, u64, u8)> {
+        const BUILD_BIT: u64 = 1; // pstatus channel 0
+        let bundle = self.bundle.as_ref()?;
+        let name = bundle.name_for_packed(packed)?;
+        let (shift, width) = resonantdust_dsl::bridge::stock_slot_bits(bundle, name, "pstatus")?;
+        let (start, end) = self.world.cards.progress_window(card_id, now_ms, |r| {
+            resonantdust_codec::bits::get_field64(r.stock, shift, width) & BUILD_BIT != 0
+        })?;
+        // `end <= start` is the degenerate missing-`end_bar` (or completion row not
+        // yet streamed) case — no meaningful window, hide the bar.
+        (end > start).then_some((start, end, 0))
     }
 
     /// The last-sampled server clock (ms).
@@ -524,7 +565,7 @@ impl Client {
     /// like the queue's own `ready` gate.
     pub fn queue_interval(&self, root: u32) -> Option<(u64, u64)> {
         let a = self.actions.get(&root)?;
-        if a.submit_cid.is_some() || a.delay_ms <= 0.0 {
+        if a.is_active() || a.delay_ms <= 0.0 {
             return None;
         }
         let elapsed = (self.perf_ms - a.scheduled_at).max(0.0);
@@ -538,7 +579,7 @@ impl Client {
     /// the pump otherwise gates re-emits on. Build bars don't need this (the hold
     /// they set IS a row change); only the pre-send debounce window does.
     pub fn has_pending_debounce(&self) -> bool {
-        self.actions.values().any(|a| a.submit_cid.is_none() && a.delay_ms > 0.0)
+        self.actions.values().any(|a| !a.is_active() && a.delay_ms > 0.0)
     }
 
     /// Anchor-aware garbage collection: reap card/zone version rows no soul
@@ -552,6 +593,8 @@ impl Client {
         let zones = &self.zones;
         self.world.cards.gc(now, |zone| zones.zone_card_pins(zone));
         self.world.zones.gc(now, |zone| zones.zone_tile_pins(zone));
+        // Tile-cards are zone tile data — pin them on the same tile watermarks.
+        self.world.tile_cards.gc(now, |zone| zones.zone_tile_pins(zone));
     }
 
     /// The souls (world actors) we control, by card_id. Populated by the
@@ -762,8 +805,25 @@ impl Client {
                             table: table.to_string(),
                             filter: Some(format!("macro_zone = {zone}")),
                         });
+                        // Promoted tile-cards ride with the zone's Card sub: same
+                        // scope, distinct gate table (`tile_cards`) + sid so the
+                        // synthetic-tile read sees live (decremented/held) stock.
+                        if data == DataType::Card {
+                            let tsid = self.sid();
+                            self.tile_card_subs.insert(zone, tsid);
+                            out.push(ClientMsg::Sub {
+                                sid: tsid,
+                                table: "tile_cards".to_string(),
+                                filter: Some(format!("macro_zone = {zone}")),
+                            });
+                        }
                     } else if let Some(sid) = self.zone_subs.remove(&key) {
                         out.push(ClientMsg::Unsub { sid });
+                        if data == DataType::Card {
+                            if let Some(tsid) = self.tile_card_subs.remove(&zone) {
+                                out.push(ClientMsg::Unsub { sid: tsid });
+                            }
+                        }
                     }
                 }
                 ZoneIntent::Region { region, subscribed } => {
@@ -947,8 +1007,12 @@ impl Client {
         use resonantdust_dsl::bridge::{card_view, Card};
         use resonantdust_dsl::vm::{Cell, Store};
         let bundle = self.bundle.as_ref()?;
-        let store = Store::with_root(card_view(bundle, &Card { def_id, stock: Vec::new(), stock_raw: 0 }));
-        store.read(&format!("aspect.{aspect}")).map(Cell::as_int)
+        let store = Store::with_root(card_view(bundle, &Card { def_id, stock: Vec::new(), stock_raw: 0, ..Default::default() }));
+        // Def aspects live in the `data.*` namespace — that's what `card_view`
+        // writes (a def's `&data.X set` and folded stock). The old `aspect.*`
+        // prefix predates the data/aspect split and always missed (→ 0), which
+        // silently zeroed anchor radii / tile cost / `inventory`.
+        store.read(&format!("data.{aspect}")).map(Cell::as_int)
     }
 
     /// Ensure the inventory zone for any container we **transitively own** that
@@ -994,10 +1058,18 @@ impl Client {
         q: i32,
         r: i32,
     ) -> Result<Vec<ClientMsg>, String> {
-        use resonantdust_codec::packed::{pack_macro_zone_full, zone_local};
+        use resonantdust_codec::packed::{pack_macro_zone_full, zone_local, STACK_DIR_UP};
         let (zq, lq) = zone_local(q);
         let (zr, lr) = zone_local(r);
         let macro_zone = pack_macro_zone_full(owner, surface, zq, zr);
+        // One root per cell: if the target cell already holds a loose root, a loose
+        // drop would collide (and `plan_place` rejects it). The drop instead stacks
+        // onto that root (STACK_DIR_UP) — the hit-test that picks `place_stack` vs
+        // `place_loose` can miss a card whose bare cell-corner the cursor landed in.
+        // The stack is still subject to the normal bit gates, so it may yet reject.
+        if let Some(parent) = stack::loose_root_at(&self.world, card_id, macro_zone, lq, lr, self.clock_ms) {
+            return self.place(card_id, stack::Placement::Stack { parent_id: parent, direction: STACK_DIR_UP });
+        }
         self.place(card_id, stack::Placement::Loose { surface, macro_zone, q: lq, r: lr, x: 0, y: 0 })
     }
 
@@ -1052,10 +1124,16 @@ impl Client {
             let (micro_location, flags) = w.micro.apply(row.flags);
             row.macro_zone = w.macro_zone;
             row.micro_location = micro_location;
-            row.flags = flags;
+            // A local (player) move OVERRIDES server position authority: clear
+            // `pos_need`/`pos_want` so this optimistic row isn't skipped by
+            // `pin_position` (which leaves pos_need rows alone) and a later server
+            // row reconciles against a clean local position. Mirrors `move_cards`.
+            row.flags = flags & !resonantdust_codec::card_model::pos_mask();
             row.valid_at = resonantdust_codec::packed::pack_valid_at(now, self.next_local_seq());
+            let local_vat = row.valid_at;
             self.world.cards.apply(RowOp::Update, row);
             self.dirty_positions.insert(w.card_id);
+            self.local_rows.entry(w.card_id).or_default().insert(local_vat);
             moved.push(w.card_id);
             if let Some(root) = self.chain_root(w.card_id) {
                 self.dirty_roots.insert(root);
@@ -1120,6 +1198,7 @@ impl Client {
                 stacks.push((c.flags & pmask) as u8);
             }
             self.dirty_positions.remove(&id);
+            self.local_rows.remove(&id);
         }
         if card_ids.is_empty() {
             return None;
@@ -1137,6 +1216,23 @@ impl Client {
                 stack_states: stacks,
             },
         })
+    }
+
+    /// The effective `(stock0, stock1)` of the world tile at `(macro_zone, q, r)`,
+    /// card-priority (a promoted tile-card's live count wins over the zone slot) —
+    /// the exact read the matcher's synthetic tile uses. `None` if the cell is empty
+    /// or unloaded. Lets a driver/harness observe a tile resource decrement.
+    pub fn world_tile_stock(&self, macro_zone: u64, q: u8, r: u8) -> Option<(u8, u8)> {
+        let now = self.clock_ms;
+        let zone = self.world.zones.current(macro_zone, now)?;
+        resonantdust_codec::packed::synthetic_tile(
+            self.world.tile_card_at(macro_zone, q, r, now),
+            &zone.tile_words(),
+            zone.tile_card_type(),
+            q,
+            r,
+        )
+        .map(|(_, s0, s1)| (s0, s1))
     }
 
     /// The `cost` aspect of the tile at world cell `(macro_zone, local lq, lr)`,
@@ -1542,7 +1638,15 @@ impl Client {
             // the recipe reads this card's actual stock aspects (build progress,
             // etc.), not just the def defaults.
             let stock = resonantdust_dsl::bridge::stock_to_vec(bundle, name, c.stock);
-            Some(Card { def_id: bundle.card_def_id(name)?, stock, stock_raw: c.stock })
+            Some(Card {
+                def_id: bundle.card_def_id(name)?,
+                stock,
+                stock_raw: c.stock,
+                macro_zone: c.macro_zone,
+                micro_location: c.micro_location,
+                flags: c.flags,
+                card_id: c.card_id,
+            })
         };
 
         // Synthetic hex tile: the tile under the root (stack 1), as the soul
@@ -1725,12 +1829,13 @@ impl Client {
 
     /// The synthetic tile under `root` for branch-0 matching: `Some` only when
     /// `root` sits on a world-tile surface, has no card on its hex branch, and a
-    /// non-empty tile occupies its cell. Reads the zone's packed tile grid for
-    /// the cell's def + stock (mirrors `getZoneTileSlot` + ActionManager's
-    /// synthetic-tile branch). Card-card tile promotion is not modelled yet.
+    /// non-empty tile occupies its cell. Card-priority via the shared
+    /// [`resonantdust_codec::packed::synthetic_tile`] rule: a promoted tile-card's
+    /// live stock (a `cut_tree`'s decrement, an in-flight hold) wins over the zone's
+    /// packed grid slot — the exact rule the gate matcher applies, so the two agree.
     fn synthetic_tile(&self, root: u32, hex_branch: &[u32], now: u64) -> Option<Card> {
         use resonantdust_codec::card_model::Micro;
-        use resonantdust_codec::packed::{pack_definition, surface_of, tile_def_id, tile_slot, tile_stock, WORLD_LAYER};
+        use resonantdust_codec::packed::{surface_of, WORLD_LAYER};
         if !hex_branch.is_empty() {
             return None; // a card occupies the hex branch — no synthetic tile
         }
@@ -1740,22 +1845,23 @@ impl Client {
             return None;
         }
         let (lq, lr) = match card.micro() {
-            Micro::Loose { local_q, local_r, .. } => (local_q as usize, local_r as usize),
+            Micro::Loose { local_q, local_r, .. } => (local_q, local_r),
             Micro::Stacked { .. } => return None,
         };
         let zone = self.world.zones.current(card.macro_zone, now)?;
-        let words = zone.tile_words();
-        let idx = tile_slot(lq as u8, lr as u8);
-        let def_id_tile = tile_def_id(&words, idx);
-        if def_id_tile == 0 {
-            return None;
-        }
-        let packed = pack_definition(zone.tile_card_type(), def_id_tile);
+        let (packed, s0, s1) = resonantdust_codec::packed::synthetic_tile(
+            self.world.tile_card_at(card.macro_zone, lq, lr, now),
+            &zone.tile_words(),
+            zone.tile_card_type(),
+            lq,
+            lr,
+        )?;
         let name = bundle.name_for_packed(packed)?;
         Some(Card {
             def_id: bundle.card_def_id(name)?,
-            stock: vec![tile_stock(&words, idx, 0) as i64, tile_stock(&words, idx, 1) as i64],
+            stock: vec![s0 as i64, s1 as i64],
             stock_raw: 0,
+            ..Default::default()
         })
     }
 
@@ -1878,6 +1984,15 @@ impl Client {
     /// loop iteration so outbound stamps stay fresh without a new sample.
     pub fn tick(&mut self, perf_ms: f64) {
         self.perf_ms = perf_ms;
+        // A debounce live at the START of this tick that's gone by the END must
+        // re-emit once, so the queue bar clears. A debounce ends three ways — it
+        // FIRES (proposed), it's CANCELLED when the server locks its cards (the
+        // re-evaluated root is now held → no match → dropped), or its root falls
+        // out of scope — and NONE of them is a row change. So the worker's
+        // `changed || has_pending_debounce` emit gate skips the very edge where
+        // the bar should disappear, freezing it mid-fill. Snapshot here, raise the
+        // render kick at the end if it fell. See [[project_action_requeue_window]].
+        let had_debounce = self.has_pending_debounce();
         if self.clock.is_synced() {
             self.clock_ms = self.clock.server_now_ms(perf_ms).max(0.0) as u64;
         }
@@ -1900,10 +2015,29 @@ impl Client {
                     true
                 }
             });
+            // A promoted card row changes the rendered world — a recipe product
+            // appears, a consumed card vanishes (dead), a moved card relocates — but
+            // its promotion fires no arrival event. Kick a re-render, same as the
+            // zone-promotion path below; otherwise the view stays stale until the
+            // next unrelated row event or a manual interaction. See
+            // [[project_future_row_progress_kick]].
+            if !due.is_empty() {
+                self.render_kick = true;
+            }
             for id in due {
                 if let Some(root) = self.chain_root(id) {
                     self.dirty_roots.insert(root);
                 }
+                // A future-stamped owned soul (e.g. a recipe-spawned chord_soul)
+                // bailed out of `discover` on arrival — `current()` excluded it
+                // while not-yet-due, so its inventory was never ensured/anchored.
+                // Now that it's promoted, re-run discovery: this is the first sight
+                // at which it reads as current, so `ensure_inventory` + `set_anchor`
+                // fire (Zone-sub → request_zone → tiles) instead of waiting for the
+                // next unrelated row event (a manual move). Idempotent — fires once
+                // per soul. See [[project_future_row_progress_kick]].
+                self.discover(id);
+                self.ensure_owned_inventory(id);
             }
         }
         // Render-promotion kick: a zone stamped ahead of the buffered clock fires
@@ -1913,9 +2047,19 @@ impl Client {
         if let Some(t) = self.next_zone_promote {
             if self.clock_ms >= t {
                 self.render_kick = true;
-                self.next_zone_promote = self.world.zones.min_future_time(self.clock_ms);
+                self.next_zone_promote = [
+                    self.world.zones.min_future_time(self.clock_ms),
+                    self.world.tile_cards.min_future_time(self.clock_ms),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
             }
         }
+        // Expire any settled (post-accept) entries whose grace lapsed, BEFORE the
+        // re-eval, so a freed root can re-match in the same tick if it legitimately
+        // should (the lock, if any, now gates it).
+        self.sweep_settled();
         // Budgeted re-identification: drain the dirty-root set at most ~1/s.
         if !self.dirty_roots.is_empty() && perf_ms - self.last_match_perf >= MATCH_BUDGET_MS {
             self.last_match_perf = perf_ms;
@@ -1927,6 +2071,12 @@ impl Client {
         if perf_ms - self.last_magnet_perf >= MAGNET_BUDGET_MS {
             self.last_magnet_perf = perf_ms;
             self.magnetic_pass();
+        }
+        // The debounce that was live at entry just ended (fired / cancelled /
+        // out-of-scope) — kick a re-emit so the queue bar's disappearance reaches
+        // the view (the emit gate wouldn't otherwise fire on this edge).
+        if had_debounce && !self.has_pending_debounce() {
+            self.render_kick = true;
         }
     }
 
@@ -2139,12 +2289,14 @@ impl Client {
     /// the one binding the most cards (e.g. `triple_corpus` over `corpus_b_top`).
     /// Single-input recipes get a zero debounce (fire-at-once).
     fn evaluate_root(&mut self, soul: u32, root: u32) {
-        // An in-flight action (proposed, awaiting its reply) must be left alone:
-        // re-queuing it would overwrite its `submit_cid`, so the reply could never
-        // resolve the action — it would dangle and its outcome be lost (the
-        // re-propose lands as a "already in flight" dup against the gate's dedup).
-        // `resolve_action` clears it on reply; the next evaluate re-queues then.
-        if self.actions.get(&root).is_some_and(|a| a.submit_cid.is_some()) {
+        // An ACTIVE action — in flight (proposed, awaiting its reply) OR settling
+        // (accepted, the server's lock not yet in our world) — must be left alone.
+        // Re-queuing an in-flight entry would orphan its reply; re-queuing a
+        // settling entry is the phantom SECOND debounce we're suppressing (the gate
+        // started the recipe, but the hold rows haven't landed, so the matcher
+        // would still see the cards as free). The settle window drops the entry once
+        // the lock is visible and `is_held` takes over the gating.
+        if self.actions.get(&root).is_some_and(|a| a.is_active()) {
             return;
         }
         let now = self.clock_ms;
@@ -2193,6 +2345,7 @@ impl Client {
                 delay_ms,
                 retry_count: 0,
                 submit_cid: None,
+                settle_until: None,
             },
         );
     }
@@ -2249,11 +2402,11 @@ impl Client {
         match error {
             None => {
                 self.action_outcomes.push((recipe, None)); // accepted
-                self.actions.remove(&root);
+                self.settle_or_drop(root);
             }
             Some(e) if e.contains("already in flight") => {
                 self.action_outcomes.push((recipe, None)); // a prior attempt landed — done
-                self.actions.remove(&root);
+                self.settle_or_drop(root);
             }
             Some(e) if e.contains("client_ahead_by") => {
                 let gap = e
@@ -2278,6 +2431,31 @@ impl Client {
                 self.actions.remove(&root);
             }
         }
+    }
+
+    /// An accepted action: the gate has started the recipe. A DEBOUNCED action
+    /// (`delay_ms > 0`) enters its SETTLE window instead of being dropped — kept,
+    /// but invisible + unrevisable — so the same root can't arm a phantom second
+    /// debounce before the server's hold rows land locally. A zero-debounce action
+    /// (single-input / lifecycle, no bar, may self-advance) just drops, so its next
+    /// match fires immediately — settling would needlessly throttle it.
+    fn settle_or_drop(&mut self, root: u32) {
+        match self.actions.get_mut(&root) {
+            Some(a) if a.delay_ms > 0.0 => {
+                a.submit_cid = None;
+                a.settle_until = Some(self.perf_ms + SETTLE_GRACE_MS);
+            }
+            _ => {
+                self.actions.remove(&root);
+            }
+        }
+    }
+
+    /// Drop SETTLING entries whose grace has lapsed (the lock has had time to land,
+    /// so normal re-evaluation can resume — `is_held` now gates any re-match).
+    fn sweep_settled(&mut self) {
+        let perf = self.perf_ms;
+        self.actions.retain(|_, a| a.settle_until.map_or(true, |deadline| perf < deadline));
     }
 
     /// Drain the final outcomes of fired queued actions: `(recipe, Err(reason)?)`.
@@ -2377,6 +2555,25 @@ impl Client {
     fn apply_row(&mut self, op: RowOp, row: RowData) -> Vec<Event> {
         match row {
             RowData::Card(mut card) => {
+                // Promoted tile-cards (card_type 7, the gate's `tile_cards` table)
+                // fold into their OWN store so they never leak into player-card
+                // enumeration/rendering — they only back the synthetic-tile
+                // card-priority read. A future-stamped completion (a `cut_tree`
+                // decrement) fires no event when it promotes, so feed the render-kick
+                // clock; none of the discovery / dirty-root / inventory logic applies.
+                if resonantdust_codec::packed::unpack_definition(card.packed_definition).0
+                    == resonantdust_codec::packed::TILE_CARD_TYPE
+                {
+                    let macro_zone = card.macro_zone;
+                    let t = card.time_ms();
+                    if t > self.clock_ms {
+                        self.next_zone_promote =
+                            Some(self.next_zone_promote.map_or(t, |n| n.min(t)));
+                    }
+                    self.world.tile_cards.apply(op, card);
+                    // Surfaced as a zone change so the viewport repaints the cell.
+                    return vec![Event::ZoneUpserted { macro_zone }];
+                }
                 {
                     let card_id = card.card_id;
                     // Position reconciliation: when we hold a pending LOCAL move for
@@ -2393,6 +2590,7 @@ impl Client {
                     {
                         if resonantdust_codec::card_model::pos_need(card.flags) {
                             self.dirty_positions.remove(&card_id);
+                            self.local_rows.remove(&card_id);
                         } else if let Some(local) = self.world.cards.current(card_id, self.clock_ms) {
                             let pmask = resonantdust_codec::card_model::placement_mask();
                             card.macro_zone = local.macro_zone;
@@ -2407,6 +2605,28 @@ impl Client {
                         RowOp::Delete => Event::CardRemoved { card_id },
                     };
                     self.world.cards.apply(op, card);
+                    match op {
+                        // Re-derive any local position rows' `stock` from the server
+                        // rows just folded in: a local move overrides POSITION only,
+                        // so an in-flight hold landing at an earlier stamp isn't
+                        // shadowed by a later local row (else `is_held` reads stale
+                        // claim=0 → re-queue the running recipe).
+                        RowOp::Insert | RowOp::Update => {
+                            if let Some(local) = self.local_rows.get(&card_id) {
+                                if !local.is_empty() {
+                                    let local = local.clone();
+                                    self.world.cards.resync_local_stock(card_id, &local);
+                                }
+                            }
+                        }
+                        RowOp::Delete => {
+                            // Only when the LAST version is gone — a single-version
+                            // delete leaves a live card whose local rows still resync.
+                            if self.world.cards.zone_of(card_id).is_none() {
+                                self.local_rows.remove(&card_id);
+                            }
+                        }
+                    }
                     // Warmth: a card update in this zone feeds the zone's Card-sub
                     // close-candidate counter (no-op unless it's a candidate).
                     self.zones.note_update(macro_zone, DataType::Card, self.clock_ms);
@@ -2954,6 +3174,7 @@ mod tests {
                 delay_ms: 5000.0,
                 retry_count: 0,
                 submit_cid: None,
+                settle_until: None,
             },
         );
         // 400ms elapsed of a 5000ms debounce → 4600ms remaining.
@@ -2963,6 +3184,109 @@ mod tests {
         assert_eq!(c.queue_interval(50), None);
         // No queued action on this root → no window.
         assert_eq!(c.queue_interval(999), None);
+    }
+
+    #[test]
+    fn ending_a_debounce_kicks_a_render() {
+        use crate::actions::QueuedAction;
+        let mut c = Client::new();
+        // A pending (not-yet-fired) action whose window has already elapsed. With
+        // no bundle loaded its fire-time re-match finds nothing, so `fire_ready`
+        // drops it — the same "debounce ends without a row change" edge the server
+        // locking the cards produces.
+        c.actions.insert(
+            50,
+            QueuedAction {
+                soul: 1,
+                recipe: "r".into(),
+                root: 50,
+                bindings: vec![],
+                surface: 0,
+                macro_zone: 0,
+                micro_location: 0,
+                scheduled_at: 0.0,
+                delay_ms: 100.0,
+                retry_count: 0,
+                submit_cid: None,
+                settle_until: None,
+            },
+        );
+        assert!(c.has_pending_debounce());
+        c.tick(1000.0); // window elapsed → fire_ready re-checks, no match → dropped
+        assert!(!c.has_pending_debounce(), "the unmatched action was dropped");
+        assert!(c.take_render_kick(), "ending the debounce raises a render kick so the bar clears");
+
+        // A tick with no debounce in flight doesn't kick.
+        c.tick(1100.0);
+        assert!(!c.take_render_kick(), "no debounce edge → no kick");
+    }
+
+    #[test]
+    fn accepted_debounced_action_settles_then_expires() {
+        use crate::actions::{QueuedAction, SETTLE_GRACE_MS};
+        let mut c = Client::new();
+        c.perf_ms = 1000.0;
+        c.actions.insert(
+            50,
+            QueuedAction {
+                soul: 1,
+                recipe: "r".into(),
+                root: 50,
+                bindings: vec![],
+                surface: 0,
+                macro_zone: 0,
+                micro_location: 0,
+                scheduled_at: 0.0,
+                delay_ms: 5000.0,
+                retry_count: 0,
+                submit_cid: Some(7),
+                settle_until: None,
+            },
+        );
+        // Accept → the entry SETTLES (kept, invisible) instead of dropping, so the
+        // root can't arm a second debounce before the lock lands.
+        c.resolve_action(7, None);
+        let a = c.actions.get(&50).expect("settling entry is kept, not dropped");
+        assert_eq!(a.submit_cid, None);
+        assert_eq!(a.settle_until, Some(1000.0 + SETTLE_GRACE_MS));
+        assert!(a.is_active(), "settling counts as active (no re-queue / re-fire)");
+        assert_eq!(c.queue_interval(50), None, "no pre-fire bar while settling");
+        assert!(!c.has_pending_debounce(), "settling is not a live debounce");
+        // Within grace → still held.
+        c.sweep_settled();
+        assert!(c.actions.contains_key(&50));
+        // Past grace → dropped; normal re-evaluation (is_held-gated) resumes.
+        c.perf_ms = 1000.0 + SETTLE_GRACE_MS + 1.0;
+        c.sweep_settled();
+        assert!(!c.actions.contains_key(&50), "settled entry expires after its grace");
+    }
+
+    #[test]
+    fn accepted_zero_delay_action_drops_immediately() {
+        use crate::actions::QueuedAction;
+        let mut c = Client::new();
+        c.perf_ms = 1000.0;
+        c.actions.insert(
+            60,
+            QueuedAction {
+                soul: 1,
+                recipe: "r".into(),
+                root: 60,
+                bindings: vec![],
+                surface: 0,
+                macro_zone: 0,
+                micro_location: 0,
+                scheduled_at: 0.0,
+                delay_ms: 0.0,
+                retry_count: 0,
+                submit_cid: Some(8),
+                settle_until: None,
+            },
+        );
+        // A zero-debounce (single-input / lifecycle) action has no bar and may
+        // self-advance — settling would throttle it, so accept just drops it.
+        c.resolve_action(8, None);
+        assert!(!c.actions.contains_key(&60), "zero-debounce action drops on accept");
     }
 
     #[test]
@@ -3118,6 +3442,64 @@ mod tests {
             matches!(c.pending_out.first(), Some(ClientMsg::Call { call, .. }) if call.reducer() == "move_cards"),
             "move in a shared zone syncs immediately"
         );
+    }
+
+    #[test]
+    fn local_move_must_not_shadow_an_inflight_hold() {
+        use resonantdust_codec::aspects::{count, inc, StockAspect};
+        use resonantdust_codec::card_model::Micro;
+        use resonantdust_codec::packed::{with_surface, WORLD_LAYER};
+
+        fn loose_row(card_id: u32, owner_id: u32, macro_zone: u64, time_ms: u64, stock: u64) -> CardRow {
+            let (micro_location, flags) = Micro::snap(0, 0).apply(0);
+            CardRow {
+                valid_at: pack_valid_at(time_ms, 1),
+                card_id,
+                macro_zone,
+                micro_location,
+                owner_id,
+                packed_definition: 0,
+                flags,
+                flags_bk: 0,
+                stock,
+            }
+        }
+
+        let world = with_surface(0, WORLD_LAYER);
+        let mut c = Client::new();
+        c.player_id = Some(7);
+        c.clock_ms = 5000;
+        // player_soul terminus + a loose world blueprint (the recipe root) owned by it.
+        c.world.cards.apply(RowOp::Insert, {
+            let mut r = loose_row(1024, 7, world, 100, 0);
+            r.packed_definition = 0xFFFF;
+            r
+        });
+        c.world.cards.apply(RowOp::Insert, loose_row(2000, 1024, world, 100, 0));
+
+        // The recipe has fired. User drags the blueprint at clock 5000 — BEFORE the
+        // gate's hold-acquire row has arrived. The local move row is stamped @5000.
+        c.place(2000, stack::Placement::Loose { surface: WORLD_LAYER, macro_zone: world, q: 1, r: 1, x: 0, y: 0 })
+            .unwrap();
+        assert!(c.dirty_positions.contains(&2000));
+
+        // Now the gate's hold-acquire row lands, stamped at the recipe START (1000 <
+        // 5000), carrying claim=1. Reconciliation keeps our local position.
+        c.apply(GateMsg::Row {
+            sid: 0,
+            op: RowOp::Update,
+            row: RowData::Card(loose_row(2000, 1024, world, 1000, inc(0, StockAspect::Claim))),
+        });
+
+        // The hold IS in the store (@1000) but the later local move row (@5000) wins
+        // `current()`, so `is_held` reads claim=0 and the matcher would re-queue.
+        let cur = c.world.cards.current(2000, 5000).unwrap();
+        assert_eq!(
+            count(cur.stock, StockAspect::Claim),
+            1,
+            "local move row shadows the in-flight hold (claim lost) → is_held()=false → re-queue"
+        );
+        assert!(c.is_held(2000, 5000), "blueprint must read as held after a local move");
     }
 
     /// A `regions` Row frame in the gate's wire shape (camelCase, stringified).

@@ -18,8 +18,8 @@ use web_sys::{MessageEvent, WebSocket};
 
 use resonantdust_codec::card_model::Micro;
 use resonantdust_codec::packed::{
-    pack_definition, pack_macro_zone_full, surface_of, tile_full, tile_slot, unpack_macro_zone,
-    unpack_zone_definition, world_tile, zone_local, INVENTORY_LAYER, ZONE_SIZE,
+    pack_macro_zone_full, surface_of, synthetic_tile, unpack_macro_zone, unpack_zone_definition,
+    world_tile, zone_local, INVENTORY_LAYER, ZONE_SIZE,
 };
 use resonantdust_protocol::protocol::{ClientCall, ClientMsg, GateMsg};
 
@@ -649,10 +649,17 @@ impl WasmClient {
             for idx in 0..(ZONE_SIZE * ZONE_SIZE) {
                 let lc = (idx % ZONE_SIZE) as u8;
                 let lr = (idx / ZONE_SIZE) as u8;
-                let (def_id, stock0, stock1) = tile_full(&words, tile_slot(lc, lr));
-                if def_id == 0 {
-                    continue;
-                }
+                // Card-priority: a promoted tile-card's LIVE stock (a `cut_tree`'s
+                // decrement) wins over the zone grid slot, which only catches up on
+                // GC demotion. The same shared rule the gate/shard matcher uses, so
+                // the visible count now tracks the tile-card the engine spawned.
+                let tile_card = world.tile_card_at(zone.macro_zone, lc, lr, now);
+                let card_backed = tile_card.is_some();
+                let Some((packed, stock0, stock1)) =
+                    synthetic_tile(tile_card, &words, card_type, lc, lr)
+                else {
+                    continue; // empty cell (no tile-card, zone def 0)
+                };
                 let q = world_tile(cq, lc);
                 let r = world_tile(cr, lr);
                 if (q - center_q).abs() > half_cols + 1 || (r - center_r).abs() > half_rows + 1 {
@@ -662,9 +669,10 @@ impl WasmClient {
                     "layer": "tile",
                     "q": q,
                     "r": r,
-                    "packed": pack_definition(card_type, def_id),
+                    "packed": packed,
                     "stock0": stock0,
                     "stock1": stock1,
+                    "cardBacked": card_backed,
                 }));
             }
         }
@@ -696,21 +704,22 @@ impl WasmClient {
             if (q - center_q).abs() > half_cols + 1 || (r - center_r).abs() > half_rows + 1 {
                 continue;
             }
-            // Progress-bar timing, as `(total, remaining)` ms so the view fills
-            // locally with its own clock — no per-frame worker round-trip.
-            // `source = 0` (build): an in-flight action HOLDS this card and
-            // future-stamps a completion row → fill from the current row (start)
-            // toward that future row (completion). `source = 1` (queue): the
-            // pre-fire debounce window. Zero total → the bar self-hides (view reads
-            // `< 0`).
-            let (p_total, p_remaining) = if resonantdust_codec::aspects::has_active_holds(row.stock) {
-                match world.cards.next_future_ms(row.card_id, now) {
-                    Some(end) if end > row.time_ms() => (end - row.time_ms(), end.saturating_sub(now)),
-                    _ => (0u64, 0u64),
-                }
-            } else {
-                (0, 0)
-            };
+            // Build bar (`source = 0`): the deterministic `pstatus` interval as
+            // ABSOLUTE server-time bounds `[pStartMs, pEndMs]`. The bit is set at
+            // hold-acquire and cleared at completion; the core scans the card's row
+            // history for the interval (see `progress_window`). The view fills it
+            // against the disciplined server clock (the same clock the completion
+            // row promotes on), so the fill and the promotion land together — no
+            // drift from a one-shot `remaining` countdown. An upcoming bar
+            // (`serverNow < pStart`) reads as fraction ≤ 0 (empty). `pbit` is the
+            // active channel; the view resolves its fill style (`visual.pstyle.N`,
+            // default ltr). Queue bar (`source = 1`) stays a client-side perf
+            // countdown below — it's the pre-fire debounce, not server time.
+            let (p_start, p_end, pbit) =
+                match self.core.progress_window(row.card_id, row.packed_definition, now) {
+                    Some((start, end, bit)) => (start, end, bit as i32),
+                    None => (0, 0, -1),
+                };
             let (q_total, q_remaining) = self.core.queue_interval(row.card_id).unwrap_or((0, 0));
             out.push(serde_json::json!({
                 "layer": "card",
@@ -726,10 +735,17 @@ impl WasmClient {
                 // `sentAt` is a string). The view keeps it opaque / BigInts it.
                 "stock": row.stock.to_string(),
                 "flags": row.flags,
-                "pTotalMs": p_total,
-                "pRemainingMs": p_remaining,
+                // Build bar: absolute server-ms bounds (0/0 = no bar). The view
+                // fills `(serverNow - pStartMs) / (pEndMs - pStartMs)`.
+                "pStartMs": p_start,
+                "pEndMs": p_end,
+                // Queue bar: client-side perf countdown (the pre-fire debounce).
                 "qTotalMs": q_total,
                 "qRemainingMs": q_remaining,
+                // Active build-bar channel (pstatus bit index), or -1 when no bar.
+                // The view resolves the fill style from it (`visual.pstyle.N`,
+                // default ltr) — presence/timing are the `pTotal/pRemaining` above.
+                "pbit": pbit,
             }));
         }
         serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())

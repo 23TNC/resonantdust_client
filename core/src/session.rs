@@ -762,7 +762,6 @@ impl Session {
         let def = |k: &str| self.core.packed_def(k).ok_or_else(|| anyhow::anyhow!("[{tag}] no {k} def"));
         let (axe_def, corpus_def) = (def("axe")?, def("corpus")?);
         let (corpus_dim_def, log_def) = (def("corpus_dim")?, def("log")?);
-        let soul = self.core.souls().next().ok_or_else(|| anyhow::anyhow!("[{tag}] no soul"))?;
         let me = self.player_id().unwrap_or(0);
 
         let owned_of = |c: &Client, d: u16, loose_only: bool| -> Vec<u32> {
@@ -779,22 +778,60 @@ impl Session {
                 .map(|r| r.card_id)
                 .collect()
         };
-        let axe = *owned_of(&self.core, axe_def, false).first().ok_or_else(|| anyhow::anyhow!("[{tag}] no axe"))?;
-        let corpus = *owned_of(&self.core, corpus_def, true).first().ok_or_else(|| anyhow::anyhow!("[{tag}] no loose corpus"))?;
+        let imm_owner =
+            |c: &Client, id: u32| c.world().cards.current(id, c.clock_ms()).map(|r| r.owner_id);
+        let corpus =
+            *owned_of(&self.core, corpus_def, true).first().ok_or_else(|| anyhow::anyhow!("[{tag}] no loose corpus"))?;
+        // The actor wielding the axe is the corpus's IMMEDIATE owner — exactly the
+        // recipe's `slot.2.0.owner`. Don't pick by `souls()` iteration order: that
+        // set tracks every owned world-placed card (incl. stale anchors from prior
+        // runs against the persistent dev DB), so it needn't be the corpus's owner.
+        let soul = imm_owner(&self.core, corpus)
+            .filter(|&o| o != 0)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] corpus {corpus} has no owner"))?;
+        // An axe in THAT soul's inventory (immediate owner == soul), so the equip
+        // and the recipe's owner-chain address the same actor.
+        let axe = *owned_of(&self.core, axe_def, false)
+            .iter()
+            .find(|&&id| imm_owner(&self.core, id) == Some(soul))
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] no axe owned by soul {soul}"))?;
 
-        // 1. EQUIP — stack the axe onto the world soul (branch UP → soul.slot.1.0).
-        self.core
-            .place(axe, Placement::Stack { parent_id: soul, direction: STACK_DIR_UP })
-            .map_err(|e| anyhow::anyhow!("[{tag}] stack axe {axe}→soul {soul} rejected: {e}"))?;
-        self.pump(Duration::from_secs(1)).await?;
-        match self.core.world().cards.current(axe, self.core.clock_ms()).map(|c| c.micro()) {
-            Some(Micro::Stacked { root, branch, index }) if root == soul && branch == STACK_DIR_UP && index == 0 => {}
-            other => bail!("[{tag}] axe {axe} not at soul.slot.1.0 (UP/0): {other:?}"),
+        // 1. EQUIP — stack the axe onto the world soul. The axe joins top+bottom
+        //    (not hex), so an UP drop lands at the soul's TOP branch: stack_id 2 =
+        //    slot.2.0 (branch == STACK_DIR_UP == 1, since stack_id = branch + 1).
+        //    Idempotent: a prior run (persistent dev DB) may have left it equipped,
+        //    in which case the place would reject ("already part of the stack").
+        let equipped = |c: &Client| {
+            matches!(
+                c.world().cards.current(axe, c.clock_ms()).map(|r| r.micro()),
+                Some(Micro::Stacked { root, branch, index })
+                    if root == soul && branch == STACK_DIR_UP && index == 0
+            )
+        };
+        if !equipped(&self.core) {
+            self.core
+                .place(axe, Placement::Stack { parent_id: soul, direction: STACK_DIR_UP })
+                .map_err(|e| anyhow::anyhow!("[{tag}] stack axe {axe}→soul {soul} rejected: {e}"))?;
+            self.pump(Duration::from_secs(1)).await?;
+        }
+        if !equipped(&self.core) {
+            bail!(
+                "[{tag}] axe {axe} not at soul.slot.2.0 (UP/top): {:?}",
+                self.core.world().cards.current(axe, self.core.clock_ms()).map(|c| c.micro())
+            );
         }
         println!("[{tag}] axe {axe} equipped on soul {soul}; moving corpus {corpus} onto tree {tile:?} ...");
 
         // 2. MOVE the corpus onto the known-wood forest tile in our anchor zone (3,3).
         let zone = pack_macro_zone_full(0, WORLD_LAYER, 3, 3);
+        // Record the tile's wood (slot 0 = pine) BEFORE the cut, so we can assert
+        // cut_tree's `&slot.1.0.data.wood dec` actually lands on the (promoted)
+        // tile-card the client now models with card-priority.
+        let wood_before = self
+            .core
+            .world_tile_stock(zone, tile.0, tile.1)
+            .map(|(s0, _)| s0)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] tree tile {tile:?} has no stock"))?;
         self.core
             .place(corpus, Placement::Loose { surface: WORLD_LAYER, macro_zone: zone, q: tile.0, r: tile.1, x: 0, y: 0 })
             .map_err(|e| anyhow::anyhow!("[{tag}] move corpus {corpus}→tree rejected: {e}"))?;
@@ -843,6 +880,22 @@ impl Session {
             bail!("[{tag}] cut_tree did not create a log");
         }
         println!("[{tag}] ✓ cut_tree effects — corpus destroyed, corpus_dim + log created");
+
+        // The tile decrement: `&slot.1.0.data.wood dec` lands on the promoted
+        // tile-card (regions DB), which the client now subscribes to + reads with
+        // card-priority. So the synthetic tile's wood must drop by exactly 1.
+        let wood_after = self
+            .core
+            .world_tile_stock(zone, tile.0, tile.1)
+            .map(|(s0, _)| s0)
+            .ok_or_else(|| anyhow::anyhow!("[{tag}] tree tile {tile:?} vanished post-cut"))?;
+        if wood_after != wood_before - 1 {
+            bail!(
+                "[{tag}] cut_tree did not decrement tile wood: {wood_before} → {wood_after} (expected {})",
+                wood_before - 1
+            );
+        }
+        println!("[{tag}] ✓ cut_tree decremented tile wood {wood_before} → {wood_after}");
 
         let errors = self.core.drain_errors();
         if !errors.is_empty() {

@@ -22,6 +22,15 @@ pub const DEFAULT_DELAY_MS: f64 = 5000.0;
 pub const MAX_TIME_DRIFT_RETRIES: u32 = 3;
 /// Padding over the reported gap when rescheduling a time-drift retry.
 pub const TIME_DRIFT_RETRY_PAD_MS: f64 = 250.0;
+/// After the gate ACCEPTS a debounced action, the entry is kept SETTLING for this
+/// long instead of being dropped, so the same root can't re-queue a phantom second
+/// debounce in the gap before the server's hold rows land locally (the gate has
+/// started the recipe, but the lock isn't in the client's world yet). Once the
+/// grace lapses the entry drops and normal re-evaluation resumes — by then the
+/// lock is visible and `is_held` gates it. Kept below `DEFAULT_DELAY_MS` so a
+/// self-advancing recipe whose hold is never observed isn't throttled beyond its
+/// own debounce. See [[project_action_requeue_window]].
+pub const SETTLE_GRACE_MS: f64 = 2000.0;
 
 
 /// One queued recipe, keyed by its chain root in the client's action queue.
@@ -47,12 +56,24 @@ pub struct QueuedAction {
     /// `cid` of the in-flight `propose` — `Some` between fire and its reply, so a
     /// `call_ok`/`call_err` can be matched back to this entry.
     pub submit_cid: Option<u32>,
+    /// Perf-clock deadline (ms) while the entry is SETTLING — set when the gate
+    /// accepts the proposal, cleared by being dropped once it lapses. A settling
+    /// entry is invisible (no bar) and unrevisable (no re-queue / re-fire); it only
+    /// exists to bridge accept → lock-visible. `None` outside that window.
+    pub settle_until: Option<f64>,
 }
 
 impl QueuedAction {
-    /// Ready to fire: not already in flight and the debounce window has elapsed.
+    /// In flight (awaiting its reply) OR settling (accepted, lock not yet visible).
+    /// Either way the orchestrator leaves it alone: no re-queue, no re-fire, no
+    /// pre-fire bar.
+    pub fn is_active(&self) -> bool {
+        self.submit_cid.is_some() || self.settle_until.is_some()
+    }
+
+    /// Ready to fire: idle (not in flight or settling) and the debounce elapsed.
     pub fn ready(&self, perf_ms: f64) -> bool {
-        self.submit_cid.is_none() && perf_ms - self.scheduled_at >= self.delay_ms
+        !self.is_active() && perf_ms - self.scheduled_at >= self.delay_ms
     }
 
     /// Same recipe + bindings as a fresh match — keep the running timer rather
@@ -79,6 +100,7 @@ mod tests {
             delay_ms: delay,
             retry_count: 0,
             submit_cid: None,
+            settle_until: None,
         }
     }
 
